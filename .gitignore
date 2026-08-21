@@ -1,0 +1,57 @@
+# Credentials and local overrides
+/api.env
+.env
+.env.*
+!*.env.example
+*.pem
+*.key
+
+# Python caches, test artifacts, and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor, browser, and operating-system artifacts
+.playwright-cli/
+.DS_Store
+.idea/
+.vscode/
+
+# Internal notes, review assets, and office documents
+/docs/
+/AGENTS.md
+/CONTEXT.md
+/assets/
+*.doc
+*.docx
+*.pdf
+*.ppt
+*.pptx
+
+# Model checkpoints, WSI files, and generated feature stores
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.svs
+*.ndpi
+*.mrxs
+*.npy
+*.h5
+*.hdf5
+
+# Private datasets and generated runs
+/data/
+/private_data/
+/runs/
+/results/
+/traces/
+/output/
+/cache/
+*.log

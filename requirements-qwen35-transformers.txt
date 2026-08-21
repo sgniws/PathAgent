@@ -1,0 +1,6 @@
+accelerate==1.14.0
+pillow==12.2.0
+requests==2.34.2
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+transformers @ git+https://github.com/huggingface/transformers.git@4af901d5ed20e86d311e64013bfe3d2dbec0eff7

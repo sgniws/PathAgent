@@ -1,0 +1,145 @@
+{
+  "schema_version": "pathagent_vqa_evidence_contracts_v1",
+  "contract_version": "vqa_evidence_contracts_v0.1",
+  "status": "public_example",
+  "term_matcher_version": "positive_term_negation_scope_v1",
+  "defaults": {
+    "maximum_evidence_patches": 4,
+    "finite_patch_negative_may_be_extrapolated": false,
+    "medical_review_status": "visual_review_pending"
+  },
+  "question_type_contracts": {
+    "structure": {
+      "source_mode": "direct_visual",
+      "scope": "global_dominant_morphology",
+      "requires_unique_visual_concept": true,
+      "report_proxy_is_truth": false
+    },
+    "diagnosis": {
+      "source_mode": "report_derived_proxy_with_visual_support",
+      "scope": "whole_slide_supported_proxy",
+      "requires_unique_visual_concept": false,
+      "report_proxy_is_truth": false
+    },
+    "differentiation": {
+      "source_mode": "report_derived_proxy_with_visual_support",
+      "scope": "whole_slide_supported_proxy",
+      "requires_unique_visual_concept": false,
+      "report_proxy_is_truth": false
+    }
+  },
+  "visual_concept_contracts": {
+    "growth_infiltrative_glandular": {
+      "contract_id": "EVCON-growth_infiltrative_glandular-v1",
+      "scope": "global_dominant_morphology",
+      "allowed_magnifications": [5],
+      "feature_groups": [["infiltrat"], ["gland", "glandular"]],
+      "minimum_feature_groups_per_patch": 2,
+      "minimum_clean_evidence_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "require_nonoverlap": true,
+      "fallback_can_be_evidence": false,
+      "quality_warning_can_be_evidence": false,
+      "conclusion_direction": "positive_visual"
+    },
+    "growth_solid_pseudopapillary": {
+      "contract_id": "EVCON-growth_solid_pseudopapillary-v1",
+      "scope": "global_dominant_morphology",
+      "allowed_magnifications": [5],
+      "feature_groups": [["solid growth", "solid pattern"], ["pseudopapill", "pseudo-papill"]],
+      "minimum_feature_groups_per_patch": 1,
+      "minimum_clean_evidence_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "require_nonoverlap": true,
+      "fallback_can_be_evidence": false,
+      "quality_warning_can_be_evidence": false,
+      "conclusion_direction": "positive_visual"
+    },
+    "growth_cribriform_intraductal": {
+      "contract_id": "EVCON-growth_cribriform_intraductal-v1",
+      "scope": "global_dominant_morphology",
+      "allowed_magnifications": [5],
+      "feature_groups": [["cribriform"], ["intraductal"]],
+      "minimum_feature_groups_per_patch": 2,
+      "minimum_clean_evidence_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "require_nonoverlap": true,
+      "fallback_can_be_evidence": false,
+      "quality_warning_can_be_evidence": false,
+      "conclusion_direction": "positive_visual"
+    },
+    "growth_acinar": {
+      "contract_id": "EVCON-growth_acinar-v1",
+      "scope": "global_dominant_morphology",
+      "allowed_magnifications": [5],
+      "feature_groups": [["acinar", "acini"], ["growth", "architecture"]],
+      "minimum_feature_groups_per_patch": 2,
+      "minimum_clean_evidence_patches": 2,
+      "required_anywhere_groups": [0],
+      "require_nonoverlap": true,
+      "fallback_can_be_evidence": false,
+      "quality_warning_can_be_evidence": false,
+      "conclusion_direction": "positive_visual"
+    },
+    "morph_intermediate_differentiation": {
+      "contract_id": "EVCON-morph_intermediate_differentiation-v1",
+      "scope": "global_dominant_morphology",
+      "allowed_magnifications": [5],
+      "feature_groups": [["gland", "glandular"], ["nuclear atypia", "pleomorphism"], ["mitotic", "mitoses"]],
+      "minimum_feature_groups_per_patch": 2,
+      "minimum_clean_evidence_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "require_nonoverlap": true,
+      "fallback_can_be_evidence": false,
+      "quality_warning_can_be_evidence": false,
+      "conclusion_direction": "positive_visual"
+    },
+    "morph_intermediate_low_differentiation": {
+      "contract_id": "EVCON-morph_intermediate_low_differentiation-v1",
+      "scope": "global_dominant_morphology",
+      "allowed_magnifications": [5],
+      "feature_groups": [["gland", "glandular"], ["nuclear atypia", "pleomorphism"], ["mitotic", "mitoses"], ["necrosis", "necrotic"]],
+      "minimum_feature_groups_per_patch": 2,
+      "minimum_clean_evidence_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "require_nonoverlap": true,
+      "fallback_can_be_evidence": false,
+      "quality_warning_can_be_evidence": false,
+      "conclusion_direction": "positive_visual"
+    }
+  },
+  "target_support_contracts": {
+    "dx_ductal_adenocarcinoma": {
+      "visual_support_concept": "growth_infiltrative_glandular",
+      "requires_zoom_confirmation": false
+    },
+    "dx_solid_pseudopapillary_neoplasm": {
+      "visual_support_concept": "growth_solid_pseudopapillary",
+      "requires_zoom_confirmation": true
+    },
+    "dx_neuroendocrine_tumor": {
+      "visual_support_concept": null,
+      "requires_zoom_confirmation": false
+    },
+    "dx_acinar_cell_carcinoma": {
+      "visual_support_concept": "growth_acinar",
+      "requires_zoom_confirmation": false
+    },
+    "diff_well": {
+      "visual_support_concept": null,
+      "requires_zoom_confirmation": false
+    },
+    "diff_intermediate": {
+      "visual_support_concept": "morph_intermediate_differentiation",
+      "requires_zoom_confirmation": false
+    },
+    "diff_intermediate_low": {
+      "visual_support_concept": "morph_intermediate_low_differentiation",
+      "requires_zoom_confirmation": false
+    },
+    "diff_low": {
+      "visual_support_concept": null,
+      "requires_zoom_confirmation": false
+    }
+  }
+}

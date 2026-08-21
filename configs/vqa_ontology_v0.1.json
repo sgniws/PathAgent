@@ -1,0 +1,176 @@
+{
+  "schema_version": "pathagent_vqa_ontology_v1",
+  "ontology_version": "vqa_ontology_v0.1",
+  "status": "public_example",
+  "language": "zh-CN",
+  "question_types": {
+    "structure": {
+      "label": "主要结构/生长方式",
+      "option_concepts": [
+        "growth_infiltrative_glandular",
+        "growth_solid_pseudopapillary",
+        "growth_cribriform_intraductal",
+        "growth_acinar"
+      ]
+    },
+    "diagnosis": {
+      "label": "诊断/亚型",
+      "option_concepts": [
+        "dx_ductal_adenocarcinoma",
+        "dx_solid_pseudopapillary_neoplasm",
+        "dx_neuroendocrine_tumor",
+        "dx_acinar_cell_carcinoma"
+      ]
+    },
+    "differentiation": {
+      "label": "分化程度",
+      "option_concepts": [
+        "diff_well",
+        "diff_intermediate",
+        "diff_intermediate_low",
+        "diff_low"
+      ]
+    }
+  },
+  "concepts": {
+    "growth_infiltrative_glandular": {
+      "question_type": "structure",
+      "label": "浸润性不规则腺体生长",
+      "visual_feature_groups": [
+        ["infiltrat"],
+        ["gland", "glandular"]
+      ],
+      "min_feature_groups_per_patch": 2,
+      "min_clean_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "focal": false
+    },
+    "growth_solid_pseudopapillary": {
+      "question_type": "structure",
+      "label": "实性伴假乳头状结构",
+      "visual_feature_groups": [
+        ["solid growth", "solid pattern"],
+        ["pseudopapill", "pseudo-papill"]
+      ],
+      "min_feature_groups_per_patch": 1,
+      "min_clean_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "focal": false
+    },
+    "growth_cribriform_intraductal": {
+      "question_type": "structure",
+      "label": "筛孔状导管内生长",
+      "visual_feature_groups": [
+        ["cribriform"],
+        ["intraductal"]
+      ],
+      "min_feature_groups_per_patch": 2,
+      "min_clean_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "focal": false
+    },
+    "growth_acinar": {
+      "question_type": "structure",
+      "label": "腺泡样生长",
+      "visual_feature_groups": [
+        ["acinar", "acini"],
+        ["growth", "architecture"]
+      ],
+      "min_feature_groups_per_patch": 2,
+      "min_clean_patches": 2,
+      "required_anywhere_groups": [0],
+      "focal": false
+    },
+    "dx_ductal_adenocarcinoma": {
+      "question_type": "diagnosis",
+      "label": "胰腺导管腺癌",
+      "report_field": "histology_group",
+      "report_values": ["ductal_adenocarcinoma"],
+      "visual_support_concept": "growth_infiltrative_glandular",
+      "requires_zoom_confirmation": false
+    },
+    "dx_solid_pseudopapillary_neoplasm": {
+      "question_type": "diagnosis",
+      "label": "胰腺实性假乳头状肿瘤",
+      "report_field": "report_primary_diagnosis",
+      "report_values": ["胰腺实性假乳头状肿瘤", "实性假乳头状肿瘤"],
+      "visual_support_concept": "growth_solid_pseudopapillary",
+      "requires_zoom_confirmation": true
+    },
+    "dx_neuroendocrine_tumor": {
+      "question_type": "diagnosis",
+      "label": "胰腺神经内分泌肿瘤",
+      "report_field": "histology_group",
+      "report_values": ["neuroendocrine_tumor"],
+      "visual_support_concept": null,
+      "requires_zoom_confirmation": false
+    },
+    "dx_acinar_cell_carcinoma": {
+      "question_type": "diagnosis",
+      "label": "胰腺腺泡细胞癌",
+      "report_field": "histology_group",
+      "report_values": ["acinar_cell_carcinoma"],
+      "visual_support_concept": "growth_acinar",
+      "requires_zoom_confirmation": false
+    },
+    "diff_well": {
+      "question_type": "differentiation",
+      "label": "高分化",
+      "report_field": "differentiation_group",
+      "report_values": ["well"],
+      "visual_support_concept": null,
+      "requires_zoom_confirmation": false
+    },
+    "diff_intermediate": {
+      "question_type": "differentiation",
+      "label": "中分化",
+      "report_field": "differentiation_group",
+      "report_values": ["intermediate"],
+      "visual_support_concept": "morph_intermediate_differentiation",
+      "requires_zoom_confirmation": false
+    },
+    "diff_intermediate_low": {
+      "question_type": "differentiation",
+      "label": "中-低分化",
+      "report_field": "differentiation_group",
+      "report_values": ["intermediate_low"],
+      "visual_support_concept": "morph_intermediate_low_differentiation",
+      "requires_zoom_confirmation": false
+    },
+    "diff_low": {
+      "question_type": "differentiation",
+      "label": "低分化",
+      "report_field": "differentiation_group",
+      "report_values": ["low"],
+      "visual_support_concept": null,
+      "requires_zoom_confirmation": false
+    },
+    "morph_intermediate_differentiation": {
+      "question_type": "evidence_only",
+      "label": "腺体形成伴中度异型",
+      "visual_feature_groups": [
+        ["gland", "glandular"],
+        ["nuclear atypia", "pleomorphism"],
+        ["mitotic", "mitoses"]
+      ],
+      "min_feature_groups_per_patch": 2,
+      "min_clean_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "focal": false
+    },
+    "morph_intermediate_low_differentiation": {
+      "question_type": "evidence_only",
+      "label": "残余腺体形成伴显著异型和增殖活性",
+      "visual_feature_groups": [
+        ["gland", "glandular"],
+        ["nuclear atypia", "pleomorphism"],
+        ["mitotic", "mitoses"],
+        ["necrosis", "necrotic"]
+      ],
+      "min_feature_groups_per_patch": 2,
+      "min_clean_patches": 2,
+      "required_anywhere_groups": [0, 1],
+      "focal": false
+    }
+  }
+}
