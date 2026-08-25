@@ -30,6 +30,8 @@ def parse_args():
                         help="Maximum API attempts for retryable 429/5xx/network/timeout/empty-response failures")
     parser.add_argument("--executor_request_char_limit", type=int, default=120000,
                         help="Hard character limit for both accumulated evidence and serialized API requests")
+    parser.add_argument("--executor_privacy_forbidden_file", type=str, default=None,
+                        help="Private JSON list of strings forbidden in external Executor requests")
     parser.add_argument("--executor_budget_rmb", type=float, default=None,
                         help="Stop before another API request after this estimated RMB budget is exhausted")
     parser.add_argument("--executor_max_consecutive_failures", type=int, default=2)

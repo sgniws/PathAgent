@@ -684,6 +684,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         api_max_attempts=args.executor_api_max_attempts,
         request_char_limit=args.executor_request_char_limit,
         budget_rmb=args.executor_budget_rmb,
+        privacy_forbidden_file=getattr(args, "executor_privacy_forbidden_file", None),
     )
     plip = plip_class(args.plip_ckpt)
     patho_model = None
@@ -882,7 +883,13 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
             for patch_name, description in supplied_descriptions.items()
         }
         question_id = pair.get("question_id") or make_unique_id(slide_id, question)
-        unique_id = make_unique_id(slide_id, question)
+        # Result filenames must remain unique when one WSI contains multiple
+        # benchmark items with an intentionally shared generic stem.  The
+        # historical fallback is retained for datasets without question IDs.
+        unique_id = make_unique_id(
+            slide_id,
+            f"{question}\n[question_id={question_id}]" if pair.get("question_id") else question,
+        )
 
         if zoom_backend == "wsi":
             if slide_id not in wsi_rows:
