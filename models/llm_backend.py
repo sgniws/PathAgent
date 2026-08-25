@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import time
@@ -24,6 +25,10 @@ class ExecutorContextBudgetExceeded(RuntimeError):
 
 class ExecutorCostBudgetExceeded(RuntimeError):
     """Raised before a request that would continue after the configured cost budget was exhausted."""
+
+
+class ExecutorPrivacyViolation(RuntimeError):
+    """Raised before network I/O when a request contains a private identifier."""
 
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -241,6 +246,7 @@ class OpenAICompatibleLLM:
     retry_base_seconds: float = 1.0
     request_char_limit: int = 120_000
     budget_rmb: Optional[float] = None
+    privacy_forbidden_values: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -292,6 +298,21 @@ class OpenAICompatibleLLM:
             payload["seed"] = seed
 
         serialized_chars = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        serialized_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        request_sha256 = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
+        fixed_forbidden = ("/data/", ".svs", ".ndpi", ".mrxs", "DEEPSEEK_API_KEY")
+        privacy_hits = sorted({value for value in (*fixed_forbidden, *self.privacy_forbidden_values) if value and value in serialized_payload})
+        if privacy_hits:
+            self.last_response_metadata = {
+                "provider": self.provider,
+                "requested_model": self.model_name,
+                "request_sha256": request_sha256,
+                "privacy_scan_passed": False,
+                "privacy_hit_count": len(privacy_hits),
+            }
+            raise ExecutorPrivacyViolation(
+                f"External request rejected by privacy scan ({len(privacy_hits)} forbidden value(s))"
+            )
         if serialized_chars > self.request_char_limit:
             raise ExecutorContextBudgetExceeded(
                 f"Executor request has {serialized_chars} characters; hard limit is {self.request_char_limit}."
@@ -373,6 +394,9 @@ class OpenAICompatibleLLM:
                     "cumulative_cost_rmb": round(self.cumulative_cost_rmb, 8),
                     "api_attempts": api_attempt,
                     "request_chars": serialized_chars,
+                    "request_sha256": request_sha256,
+                    "privacy_scan_passed": True,
+                    "privacy_hit_count": 0,
                     "provider_latency_ms": round((time.time() - started_at) * 1000),
                 }
                 return strip_thinking_block(str(content))
@@ -392,6 +416,9 @@ class OpenAICompatibleLLM:
                 "returned_model": self.returned_model_name,
                 "api_attempts": attempts_used,
                 "request_chars": serialized_chars,
+                "request_sha256": request_sha256,
+                "privacy_scan_passed": True,
+                "privacy_hit_count": 0,
                 "provider_latency_ms": round((time.time() - started_at) * 1000),
             }
         raise ExecutorAPIError(f"Chat completions request failed: {last_error}") from last_error
@@ -439,6 +466,7 @@ def load_llm_backend(
     api_max_attempts: int = 1,
     request_char_limit: int = 120_000,
     budget_rmb: Optional[float] = None,
+    privacy_forbidden_file: Optional[str] = None,
 ) -> Tuple[Any, Any]:
     provider = provider.lower()
     if provider == "deepseek":
@@ -448,6 +476,13 @@ def load_llm_backend(
         if not resolved_key:
             location = env_file or "DEEPSEEK_API_KEY"
             raise UnsupportedModelError(f"DeepSeek API key is missing; fill DEEPSEEK_API_KEY in {location}.")
+        privacy_values: Tuple[str, ...] = ()
+        if privacy_forbidden_file:
+            with open(privacy_forbidden_file, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, list) or any(not isinstance(value, str) for value in loaded):
+                raise ValueError("Executor privacy forbidden file must be a JSON list of strings")
+            privacy_values = tuple(value for value in loaded if value)
         return OpenAICompatibleLLM(
             base_url=api_base_url or env_values.get("DEEPSEEK_BASE_URL") or DEEPSEEK_DEFAULT_BASE_URL,
             model_name=api_model or env_values.get("DEEPSEEK_MODEL") or DEEPSEEK_DEFAULT_MODEL,
@@ -457,6 +492,7 @@ def load_llm_backend(
             max_attempts=api_max_attempts,
             request_char_limit=request_char_limit,
             budget_rmb=budget_rmb,
+            privacy_forbidden_values=privacy_values,
         ), None
 
     if not checkpoint_path:
