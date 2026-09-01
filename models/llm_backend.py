@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import fcntl
 import os
 import re
 import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -247,6 +250,9 @@ class OpenAICompatibleLLM:
     request_char_limit: int = 120_000
     budget_rmb: Optional[float] = None
     privacy_forbidden_values: Tuple[str, ...] = ()
+    shared_state_path: Optional[str] = None
+    retry_schedule_seconds: Tuple[float, float, float] = (2.0, 3.0, 5.0)
+    required_returned_model: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -261,6 +267,80 @@ class OpenAICompatibleLLM:
         self.last_response_metadata: Dict[str, Any] = {}
         self.returned_model_name: Optional[str] = None
         self.cumulative_cost_rmb = 0.0
+
+    def _shared_transaction(self, update) -> Dict[str, Any]:
+        if not self.shared_state_path:
+            state: Dict[str, Any] = {}
+            update(state)
+            return state
+        path = Path(self.shared_state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            update(state)
+            temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+            return state
+
+    def _wait_for_shared_breaker(self) -> None:
+        while self.shared_state_path:
+            state = self._shared_transaction(lambda value: None)
+            remaining = float(state.get("pause_until_epoch") or 0.0) - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 30.0))
+
+    def _estimated_worst_case_cost(self, serialized_chars: int, max_new_tokens: int) -> float:
+        return (
+            serialized_chars * DEEPSEEK_PRICES_RMB_PER_MILLION["prompt_cache_miss"]
+            + max_new_tokens * DEEPSEEK_PRICES_RMB_PER_MILLION["completion"]
+        ) / 1_000_000
+
+    def _reserve_shared_cost(self, amount: float, *, kind: str) -> float:
+        def update(state: Dict[str, Any]) -> None:
+            state.setdefault("schema_version", "pathagent_deepseek_shared_state_v1")
+            state["estimated_cost_rmb"] = round(float(state.get("estimated_cost_rmb") or 0.0) + amount, 8)
+            state["last_cost_kind"] = kind
+            state["updated_at_epoch"] = time.time()
+        state = self._shared_transaction(update)
+        return float(state.get("estimated_cost_rmb") or 0.0)
+
+    def _register_breaker(self, seconds: float, reason: str) -> None:
+        until = time.time() + max(0.0, seconds)
+        def update(state: Dict[str, Any]) -> None:
+            state.setdefault("schema_version", "pathagent_deepseek_shared_state_v1")
+            state["pause_until_epoch"] = max(float(state.get("pause_until_epoch") or 0.0), until)
+            state["last_retry_reason"] = reason
+            state["updated_at_epoch"] = time.time()
+        self._shared_transaction(update)
+
+    def _shared_cost(self) -> float:
+        if not self.shared_state_path:
+            return self.cumulative_cost_rmb
+        return float(self._shared_transaction(lambda value: None).get("estimated_cost_rmb") or 0.0)
+
+    def _retry_wait_seconds(self, exc: BaseException, response: Any = None) -> float:
+        connect_wait, server_wait, disconnect_wait = self.retry_schedule_seconds
+        message = f"{type(exc).__name__}: {exc}".lower()
+        if response is not None and int(getattr(response, "status_code", 0)) == 429:
+            header = (getattr(response, "headers", {}) or {}).get("Retry-After")
+            if header:
+                try:
+                    return max(connect_wait, float(header))
+                except ValueError:
+                    try:
+                        return max(connect_wait, parsedate_to_datetime(header).timestamp() - time.time())
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+            return connect_wait
+        if response is not None and int(getattr(response, "status_code", 0)) >= 500:
+            return server_wait
+        if isinstance(exc, requests.Timeout) or "remotedisconnected" in message or "read timed out" in message:
+            return disconnect_wait
+        return connect_wait
 
     def generate_messages(
         self,
@@ -332,6 +412,14 @@ class OpenAICompatibleLLM:
         attempts_used = 0
         for api_attempt in range(1, self.max_attempts + 1):
             attempts_used = api_attempt
+            self._wait_for_shared_breaker()
+            worst_case = self._estimated_worst_case_cost(serialized_chars, max_new_tokens)
+            if self.budget_rmb is not None and self._shared_cost() + worst_case > self.budget_rmb:
+                raise ExecutorCostBudgetExceeded(
+                    f"Shared Executor budget would be exceeded: {self._shared_cost():.6f} + "
+                    f"{worst_case:.6f} > {self.budget_rmb:.6f} RMB."
+                )
+            response = None
             try:
                 response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
                 status_code = int(getattr(response, "status_code", 200))
@@ -360,6 +448,9 @@ class OpenAICompatibleLLM:
                             "non-retryable response omitted the returned model identity"
                         )
                     if (
+                        self.required_returned_model is not None
+                        and returned_model != self.required_returned_model
+                        or
                         self.returned_model_name is not None
                         and returned_model != self.returned_model_name
                     ):
@@ -383,6 +474,7 @@ class OpenAICompatibleLLM:
                 usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
                 request_cost = _deepseek_cost_rmb(usage) if self.provider == "deepseek" else 0.0
                 self.cumulative_cost_rmb += request_cost
+                shared_cost = self._reserve_shared_cost(request_cost, kind="confirmed_success")
                 self.last_response_metadata = {
                     "provider": self.provider,
                     "requested_model": self.model_name,
@@ -392,6 +484,7 @@ class OpenAICompatibleLLM:
                     "usage": usage,
                     "estimated_cost_rmb": round(request_cost, 8),
                     "cumulative_cost_rmb": round(self.cumulative_cost_rmb, 8),
+                    "shared_estimated_cost_rmb": round(shared_cost, 8),
                     "api_attempts": api_attempt,
                     "request_chars": serialized_chars,
                     "request_sha256": request_sha256,
@@ -405,9 +498,19 @@ class OpenAICompatibleLLM:
                 retryable = isinstance(exc, requests.RequestException) or str(exc).startswith(
                     ("retryable HTTP", "empty response content")
                 )
-                if not retryable or api_attempt >= self.max_attempts:
+                if not retryable:
                     break
-                time.sleep(self.retry_base_seconds * (2 ** (api_attempt - 1)))
+                wait_seconds = self._retry_wait_seconds(exc, response=response)
+                if isinstance(exc, requests.RequestException):
+                    self._reserve_shared_cost(worst_case, kind="ambiguous_retry_reserve")
+                if self.shared_state_path:
+                    self._register_breaker(wait_seconds, f"{type(exc).__name__}: {exc}")
+                if api_attempt >= self.max_attempts:
+                    break
+                if self.shared_state_path:
+                    self._wait_for_shared_breaker()
+                else:
+                    time.sleep(self.retry_base_seconds * (2 ** (api_attempt - 1)))
 
         if not self.last_response_metadata.get("model_identity_drift"):
             self.last_response_metadata = {
@@ -467,6 +570,9 @@ def load_llm_backend(
     request_char_limit: int = 120_000,
     budget_rmb: Optional[float] = None,
     privacy_forbidden_file: Optional[str] = None,
+    shared_state_path: Optional[str] = None,
+    retry_schedule_seconds: Tuple[float, float, float] = (2.0, 3.0, 5.0),
+    required_returned_model: Optional[str] = None,
 ) -> Tuple[Any, Any]:
     provider = provider.lower()
     if provider == "deepseek":
@@ -493,6 +599,9 @@ def load_llm_backend(
             request_char_limit=request_char_limit,
             budget_rmb=budget_rmb,
             privacy_forbidden_values=privacy_values,
+            shared_state_path=shared_state_path,
+            retry_schedule_seconds=retry_schedule_seconds,
+            required_returned_model=required_returned_model,
         ), None
 
     if not checkpoint_path:

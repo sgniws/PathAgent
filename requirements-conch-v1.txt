@@ -1,0 +1,15 @@
+# CONCH v1 adapter dependencies. Install the official CONCH source separately
+# from the gated, user-downloaded repository; do not redistribute its weights.
+torch>=2.0.1
+torchvision
+transformers>=4.51.0
+tokenizers>=0.21.4
+numpy>=2.0.2
+scikit-learn>=1.5.2
+timm>=0.9.8
+regex
+ftfy
+h5py>=3.14.0
+pandas>=2.3.0
+Pillow>=11.2.1
+openslide-python>=1.4.2

@@ -1,31 +1,36 @@
-# PathAgent 使用说明
+# PathAgent 使用与发布说明
 
-本文档说明最小公开版本的环境依赖、输入格式、运行方法、Trace、安全边界和已知限制。
+本文档说明 PathAgent 的环境依赖、输入格式、运行方法、Trace 审计、数据安全和已知限制。
 
 ## 环境与版本
 
-推荐使用 Linux 和 NVIDIA GPU。当前验证环境如下：
+推荐在 Linux 和 NVIDIA GPU 环境运行。当前验证过的主环境如下：
 
 | 组件 | 版本或要求 |
 |---|---|
 | Python | 3.9 |
 | PyTorch | 2.7.1 + CUDA 12.8 |
 | torchvision | 0.22.1 + CUDA 12.8 |
-| transformers | 4.51.0（主环境） |
+| transformers | 4.51.0（PathAgent 主环境） |
 | OpenSlide Python | 1.4.2 |
 | h5py | 3.14.0 |
-| PLIP | 外部源码和 checkpoint |
-| Patho-R1 | Qwen2.5-VL 架构 checkpoint |
-| Qwen3.5 服务 | 建议使用独立 Python 3.11 环境 |
+| PLIP | 外部源码仓库和对应 checkpoint |
+| CONCH v1（可选） | 官方源码、用户自行获权下载的 checkpoint；仅限其许可允许的非商业科研用途 |
+| Patho-R1 | Qwen2.5-VL 架构的 Patho-R1 checkpoint |
+| Qwen3.5 | 建议在独立 Python 3.11 环境中启动服务 |
 
-安装系统依赖：
+显存需求取决于模型大小、是否在线运行 Patho-R1 以及部署方式。建议将 Qwen Executor 独立部署为 OpenAI-compatible 服务，避免与 Patho-R1、Retriever 同进程竞争显存。
+
+### 系统依赖
+
+Ubuntu/Debian 可安装：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y libopenslide0 openslide-tools
 ```
 
-安装主环境：
+### 安装主环境
 
 ```bash
 conda create -n pathagent python=3.9 -y
@@ -36,17 +41,27 @@ pip install torch==2.7.1 torchvision==0.22.1 \
 pip install -r requirements.txt
 ```
 
+如果本机 CUDA 版本不同，请从 PyTorch 官方安装说明中选择匹配的 wheel。
+
 PLIP 当前以外部源码目录的形式加载：
 
 ```bash
 git clone https://github.com/PathologyFoundation/plip.git /path/to/plip
 ```
 
-模型权重、WSI、特征文件和数据集不包含在仓库中，需要单独准备。
+模型权重、WSI、特征文件和数据集不包含在本仓库中，需要单独准备。
 
-### Qwen3.5 独立服务
+CONCH v1 也从官方源码目录加载。先按上游要求单独取得源码和 gated 权重，再安装兼容依赖：
 
-主环境固定的 `transformers==4.51.0` 不支持当前 Qwen3.5 架构。可建立独立环境并启动 OpenAI-compatible 服务：
+```bash
+pip install -r requirements-conch-v1.txt
+```
+
+本仓库不下载、不提交也不重新分发 CONCH 权重。当前适配器冻结官方 `conch_ViT-B-16` 的 448×448 输入、512维 contrastive projection、FP32推理及单位归一化输出；CONCH 第一版只支持原始 WSI 后端，不支持 `legacy_jpeg`。
+
+### Qwen3.5 独立服务环境
+
+主环境固定的 `transformers==4.51.0` 不支持当前 Qwen3.5 架构，因此建议单独创建 Python 3.11 环境。`requirements-qwen35-transformers.txt` 已固定到本项目验证过的 Transformers 提交。
 
 ```bash
 uv venv .venv-qwen35 --python 3.11
@@ -69,7 +84,7 @@ curl http://127.0.0.1:18004/health
 
 ## 输入数据
 
-以下示例均使用虚构标识。仓库不提供患者数据、报告、WSI、模型权重或预计算特征。
+仓库不提供患者数据、WSI、报告、问题集、模型权重或预计算特征。以下示例全部使用虚构标识。
 
 ### 问题文件
 
@@ -89,11 +104,11 @@ curl http://127.0.0.1:18004/health
 }
 ```
 
-盲法推理时不要把金标准答案、报告证据或审核备注写入 Executor 可见输入。
+正式盲法推理时，不要把金标准答案、报告证据或审核备注写入 Executor 可见输入。建议将标签保存在独立文件中，仅在推理结束后评分。
 
 ### WSI manifest
 
-WSI 后端读取 JSONL，每行至少包含：
+WSI 后端读取 JSONL；每行至少包含：
 
 ```json
 {"slide_id":"demo_slide_001","slide_path":"/path/to/demo_slide_001.svs"}
@@ -101,29 +116,42 @@ WSI 后端读取 JSONL，每行至少包含：
 
 ### Patch manifest
 
-每张 WSI 对应一个 `<slide_id>.jsonl`：
+每张 WSI 对应一个 JSONL，文件名建议为 `<slide_id>.jsonl`。选中区域至少需要：
 
 ```json
 {"slide_id":"demo_slide_001","patch_id":"patch_0001","selected":true,"x_level0":0,"y_level0":0,"width_level0":4096,"height_level0":4096,"mpp_x":0.25,"mpp_y":0.25}
 ```
 
-坐标必须使用 Level-0 坐标。
+坐标必须使用 Level-0 坐标。不要在清单中写入姓名、住院号或其他直接身份信息。
 
-### PLIP HDF5
+### Retriever HDF5
 
-每张 WSI 对应一个 `<slide_id>.h5`，至少包含：
+PLIP 历史文件名为 `<slide_id>.plip.v1.h5`。CONCH v1 文件名为 `<slide_id>.conch_v1.h5`，并额外绑定 checkpoint、源码 revision、模型配置、预处理、patch manifest 和 WSI 指纹。每张 WSI 至少包含：
 
 - 文件属性 `status="complete"`；
 - 一维数据集 `patch_id`；
-- 二维数据集 `features`，行数与 `patch_id` 一致。
+- 二维数据集 `features`，行数与 `patch_id` 完全一致。
 
-### GrandQC tissue mask
+CONCH 特征必须先由同一个 `pathagent` 环境预计算，不能拿 PLIP H5 与 CONCH 在线 query 混用：
 
-WSI focus 需要每张切片对应的二值组织 mask，文件名为 `<slide_id>.grandqc.png`。通过 `--focus_tissue_mask_dirs` 显式指定目录；程序不会搜索内部约定路径。
+```bash
+conda run --no-capture-output -n pathagent python \
+  scripts/precompute_retriever_features.py \
+  --retriever-backend conch_v1 \
+  --retriever-lib-path /path/to/conch/source \
+  --retriever-checkpoint /path/to/conch/pytorch_model.bin \
+  --wsi-manifest "${DATA_ROOT}/wsi_manifest.jsonl" \
+  --patch-manifest-dir "${DATA_ROOT}/patch_manifests" \
+  --output-dir "${DATA_ROOT}/retriever_features/conch_v1" \
+  --device cuda:0 --precision fp32 --batch-size 16 \
+  --run-name conch-v1-precompute-001
+```
+
+脚本逐 WSI 加锁、写唯一临时文件、关闭后重开自检并原子落盘。已有目标文件只有在全部 metadata、patch 顺序、维度、有限值和范数完全匹配时才会跳过；不匹配时停止，不会覆盖。
 
 ## 使用方法
 
-先设置本地路径。不要把真实数据路径提交到 Git：
+先设置本地路径。以下变量仅存在于当前 shell，不要把真实数据路径写入版本库：
 
 ```bash
 export PLIP_REPO=/path/to/plip
@@ -134,7 +162,7 @@ export DATA_ROOT=/path/to/private-data
 export RUN_ROOT=/path/to/output/pathagent-demo
 ```
 
-### 原始 WSI 后端
+### 使用原始 WSI 后端
 
 ```bash
 python pathagent.py \
@@ -151,7 +179,6 @@ python pathagent.py \
   --wsi_manifest "${DATA_ROOT}/wsi_manifest.jsonl" \
   --patch_manifest_dir "${DATA_ROOT}/patch_manifests" \
   --feature_h5_dir "${DATA_ROOT}/plip_features" \
-  --focus_tissue_mask_dirs "${DATA_ROOT}/grandqc_masks" \
   --questions_file "${DATA_ROOT}/questions.json" \
   --dataset_name local_wsi \
   --save_dir "${RUN_ROOT}/results" \
@@ -159,81 +186,125 @@ python pathagent.py \
   --run_id demo-run-001
 ```
 
-`--zoom_backend wsi` 不会静默回退到 JPEG。缺少 WSI、patch manifest 或 HDF5 特征时程序会停止。
+`--zoom_backend wsi` 不会静默回退到 JPEG。缺少 WSI manifest、patch manifest 或 HDF5 特征时，程序会直接停止。
 
-### 历史 JPEG patch 后端
+### 使用 CONCH v1 Retriever
 
-将上面命令中的 WSI 参数替换为：
+在上面的 WSI 命令中，把三个 PLIP/feature 参数替换为通用参数：
 
 ```text
---zoom_backend legacy_jpeg \
---descriptions_file "${DATA_ROOT}/patch_descriptions.json" \
---feature_dir "${DATA_ROOT}/patch_features" \
---patch_root "${DATA_ROOT}/patch_images"
+--retriever_backend conch_v1 \
+--retriever_lib_path /path/to/conch/source \
+--retriever_checkpoint /path/to/conch/pytorch_model.bin \
+--retriever_feature_dir "${DATA_ROOT}/retriever_features/conch_v1"
 ```
 
-### DeepSeek Executor
+PLIP 仍是默认后端，旧的 `--plip_lib_path`、`--plip_ckpt` 和 `--feature_h5_dir` 命令保持兼容。若新旧 PLIP 参数同时给出但路径冲突，程序会立即停止。CONCH 必须显式提供全部通用参数，不能从 PLIP 参数猜测路径。
 
-复制示例环境文件并限制权限：
+### 使用历史 JPEG patch 后端
+
+```bash
+python pathagent.py \
+  --executor_protocol general_v2 \
+  --zoom_backend legacy_jpeg \
+  --plip_lib_path "${PLIP_REPO}" \
+  --plip_ckpt "${PLIP_CKPT}" \
+  --patho_r1_ckpt "${PATHO_R1_CKPT}" \
+  --executor_provider qwen \
+  --qwen_ckpt "${QWEN_CKPT}" \
+  --qwen_backend openai_compatible \
+  --qwen_api_base_url http://127.0.0.1:18004/v1 \
+  --qwen_api_model Qwen/Qwen3.5-4B \
+  --descriptions_file "${DATA_ROOT}/patch_descriptions.json" \
+  --feature_dir "${DATA_ROOT}/patch_features" \
+  --patch_root "${DATA_ROOT}/patch_images" \
+  --questions_file "${DATA_ROOT}/questions.json" \
+  --dataset_name local_wsi \
+  --save_dir "${RUN_ROOT}/results"
+```
+
+### 使用 DeepSeek Executor
+
+DeepSeek 只替换文本 Executor；Retriever 与 Patho-R1 仍在本地运行。复制示例环境文件并限制权限：
 
 ```bash
 cp api.env.example api.env
 chmod 600 api.env
 ```
 
-填写 `DEEPSEEK_API_KEY` 后，将运行参数改为：
+在 `api.env` 中填写：
+
+```dotenv
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+然后在 WSI 命令中改用：
 
 ```text
 --executor_provider deepseek --executor_env_file api.env
 ```
 
-不要在命令行直接传递真实密钥。调用外部 API 前，必须确认发送内容已经去标识化并符合数据使用审批。
+不要在命令行中直接传递真实密钥；命令行参数可能出现在 shell 历史和进程列表中。调用外部 API 前，必须确认发送内容已经去标识化，并符合数据使用与伦理审批要求。
 
-### 确定性证据合同
+### 启用确定性证据合同
 
-仓库提供两份脱敏示例：
-
-- `configs/vqa_evidence_contracts_v0.1.json`
-- `configs/vqa_ontology_v0.1.json`
-
-启用方式：
+`general_v2` 可以用 `contract_v1` 代替模型自判证据充分性：
 
 ```text
 --evidence_policy contract_v1 \
---evidence_contracts_path configs/vqa_evidence_contracts_v0.1.json \
---option_ontology_path configs/vqa_ontology_v0.1.json \
+--evidence_contracts_path /path/to/evidence_contracts.json \
+--option_ontology_path /path/to/option_ontology.json \
 --descriptions_file /path/to/clean_descriptions.json \
 --description_manifest /path/to/description_manifest.jsonl
 ```
 
 该模式要求 WSI 后端、经过审核的描述 manifest 和可追溯证据引用。
 
-## Trace 与测试
+## Trace 审计
 
-指定 `--trace_dir` 后，PathAgent 会写入事件日志和最终结构化 Trace。Trace 可能包含 slide 标识、局部路径和派生证据，分享前必须脱敏。
+运行结束后可检查 Trace 数量、动作、引用和终止状态：
 
-核心测试使用 mock、临时文件和合成数据，不需要模型权重、私有 WSI 或 API 密钥：
+```bash
+python scripts/audit_trace_run.py \
+  --trace_dir "${RUN_ROOT}/traces" \
+  --expected_traces 1 \
+  --expected_rollouts_per_question 1
+```
+
+运行输出可能包含 slide 标识、局部路径和派生证据。公开分享前必须再次脱敏，不要直接提交 `results/`、`traces/` 或本地审核页面。
+
+## 测试
 
 ```bash
 python -m pip install "pytest>=8,<10"
 python -m pytest -q
 ```
 
-## 数据隐私
+默认单元测试不下载模型，也不会启动外部 API 正式调用；真实 CONCH smoke 需要用户自行准备的官方权重和本地 GPU。
 
-- 不要提交 `api.env`、`.env*`、模型权重、WSI、HDF5/NumPy 特征、运行结果或缓存；
-- WSI 路径、slide ID、患者 ID、报告文本和 Trace 都可能包含敏感信息；
-- 外部 API 只应接收经过授权和去标识化的数据；
-- 如果密钥曾进入 Git，应立即吊销，并在公开前重写 Git 历史。
+## 可选工具依赖
+
+部分数据准备脚本需要额外环境，例如 OpenCV、`segmentation-models-pytorch`、Trident、CLAM、Quilt-LLaVA 或 COCO caption evaluation。它们不属于核心推理依赖，应按照相应上游项目单独安装。不要把第三方源码、模型权重或数据集直接复制进本仓库。
+
+## 数据隐私与发布安全
+
+- `api.env`、`.env*`、模型权重、WSI、HDF5/NumPy 特征、运行结果和缓存不应进入 Git；
+- 公开前应同时扫描当前文件和完整 Git 历史，仅删除最新版本中的敏感文件是不够的；
+- WSI 路径、slide ID、患者 ID、报告文本、Trace 和审核记录均可能构成敏感研究数据；
+- 外部 API 仅适合接收经过授权和去标识化的文本；
+- 如果密钥曾经进入 Git 历史，应先吊销并重新生成，再重写历史。
 
 ## 已知限制
 
-- 当前实现仍以研究代码为主，尚未封装为可安装的 Python 包；
-- WSI、patch manifest 和 PLIP 特征需要用户自行生成；
-- 模型置信度未经临床校准；有限 patch 上未发现证据不能推出整张 WSI 阴性；
-- 本项目仅用于科研与工程验证，不能替代病理医师。
+- 当前实现以研究脚本为主，尚未封装为可安装的 Python 包；
+- 原始 WSI 资产构建依赖多个外部项目，尚未提供统一的一键下载流程；
+- `pathagent_v2.py` 和部分实验编排脚本职责较多，后续适合拆分为状态、动作、策略和 I/O 子模块；
+- 模型置信度尚未经过临床校准；有限 patch 上未发现证据不能推出整张 WSI 阴性；
+- 本项目仅用于科研和工程验证，不能替代病理医师。
 
-## 引用与许可证
+## 引用
 
 ```bibtex
 @inproceedings{chen2026pathagent,
@@ -244,5 +315,10 @@ python -m pytest -q
   organization={Springer}
 }
 ```
+
+- 项目主页：[GitHub](https://github.com/G14nTDo4/PathAgent)
+- 论文：[arXiv:2511.17052](https://arxiv.org/abs/2511.17052)
+
+## License
 
 本项目采用 Apache License 2.0，详见 `LICENSE`。

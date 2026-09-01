@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -77,6 +78,33 @@ def load_wsi_manifest(path: str | Path) -> dict[str, dict[str, Any]]:
     return result
 
 
+def resolve_wsi_input_fingerprint(wsi_row: dict[str, Any]) -> tuple[str, str]:
+    """Return the authoritative WSI fingerprint or a deterministic legacy fallback."""
+    manifest_value = str(wsi_row.get("input_fingerprint_sha256") or "").strip()
+    if manifest_value:
+        return manifest_value, "manifest_input_fingerprint_sha256"
+    slide_path = Path(str(wsi_row["slide_path"])).resolve()
+    stat = slide_path.stat()
+    legacy_fields = {
+        "path": str(slide_path),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "format": wsi_row.get("format"),
+        "width": wsi_row.get("width"),
+        "height": wsi_row.get("height"),
+        "level_count": wsi_row.get("level_count"),
+        "level_dimensions": wsi_row.get("level_dimensions"),
+        "level_downsamples": wsi_row.get("level_downsamples"),
+        "mpp_x": wsi_row.get("mpp_x"),
+        "mpp_y": wsi_row.get("mpp_y"),
+        "objective_power": wsi_row.get("objective_power"),
+    }
+    payload = json.dumps(
+        legacy_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest(), "legacy_stat_and_pyramid_metadata_v1"
+
+
 def load_patch_manifest(path: str | Path, selected_only: bool = True) -> dict[str, WSIRegion]:
     regions = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -117,6 +145,137 @@ def load_plip_h5(path: str | Path) -> tuple[list[str], np.ndarray]:
     if not np.isfinite(features).all():
         raise ValueError(f"Non-finite PLIP feature in {path}")
     return patch_ids, features
+
+
+def retriever_feature_filename(slide_id: str, backend: str) -> str:
+    if backend == "plip":
+        return f"{slide_id}.plip.v1.h5"
+    if backend == "conch_v1":
+        return f"{slide_id}.conch_v1.h5"
+    raise ValueError(f"Unsupported retriever backend: {backend}")
+
+
+def load_retriever_h5(
+    path: str | Path,
+    *,
+    expected_spec: Any,
+    expected_patch_ids: list[str] | None = None,
+    expected_manifest_sha256: str | None = None,
+    expected_input_fingerprint_sha256: str | None = None,
+) -> tuple[list[str], np.ndarray, dict[str, Any]]:
+    """Load a model-bound retriever asset and reject embedding-space drift."""
+    path = Path(path)
+    if getattr(expected_spec, "backend", None) == "plip":
+        patch_ids, features = load_plip_h5(path)
+        if expected_patch_ids is not None and patch_ids != expected_patch_ids:
+            raise RuntimeError(f"PLIP HDF5 patch order mismatch: {path}")
+        return patch_ids, features, {
+            "schema_version": "pathagent_plip_features_v1",
+            "retriever_backend": "plip",
+            "legacy_asset": True,
+        }
+
+    with h5py.File(path, "r") as handle:
+        attrs = {
+            str(key): (
+                value.decode("utf-8") if isinstance(value, bytes) else value.item()
+                if hasattr(value, "item")
+                else value
+            )
+            for key, value in handle.attrs.items()
+        }
+        if attrs.get("status") != "complete":
+            raise RuntimeError(f"Retriever feature file is not complete: {path}")
+        if attrs.get("schema_version") != "pathagent_retriever_features_v1":
+            raise RuntimeError(f"Unexpected retriever HDF5 schema: {path}")
+        expected_attrs = {
+            "retriever_backend": expected_spec.backend,
+            "model_id": expected_spec.model_id,
+            "checkpoint_sha256": expected_spec.checkpoint_sha256,
+            "source_revision": expected_spec.source_revision,
+            "source_dirty": expected_spec.source_dirty,
+            "model_config_sha256": expected_spec.model_config_sha256,
+            "preprocess_sha256": expected_spec.preprocess_sha256,
+            "embedding_dim": expected_spec.embedding_dim,
+            "model_input_pixels": expected_spec.input_size,
+            "feature_dtype": expected_spec.output_dtype,
+        }
+        mismatches = {
+            key: {"expected": expected, "actual": attrs.get(key)}
+            for key, expected in expected_attrs.items()
+            if str(attrs.get(key)) != str(expected)
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"Retriever embedding-space metadata mismatch for {path}: {mismatches}"
+            )
+        if not bool(attrs.get("normalized")):
+            raise RuntimeError(f"Retriever HDF5 is not marked normalized: {path}")
+        required_datasets = {
+            "features",
+            "patch_id",
+            "coords",
+            "width_level0",
+            "height_level0",
+            "read_level",
+            "read_downsample",
+            "read_size",
+        }
+        missing_datasets = sorted(required_datasets - set(handle.keys()))
+        if missing_datasets:
+            raise RuntimeError(
+                f"Retriever HDF5 is missing datasets {missing_datasets}: {path}"
+            )
+        patch_ids = [
+            value.decode("utf-8") if isinstance(value, bytes) else str(value)
+            for value in handle["patch_id"][:]
+        ]
+        features = handle["features"][:].astype(np.float32)
+        expected_row_shapes = {
+            "coords": (len(patch_ids), 2),
+            "width_level0": (len(patch_ids),),
+            "height_level0": (len(patch_ids),),
+            "read_level": (len(patch_ids),),
+            "read_downsample": (len(patch_ids),),
+            "read_size": (len(patch_ids), 2),
+        }
+        bad_shapes = {
+            key: {"expected": shape, "actual": handle[key].shape}
+            for key, shape in expected_row_shapes.items()
+            if handle[key].shape != shape
+        }
+        if bad_shapes:
+            raise RuntimeError(f"Retriever HDF5 dataset shape mismatch: {bad_shapes}")
+
+    if features.ndim != 2 or features.shape != (
+        len(patch_ids),
+        int(expected_spec.embedding_dim),
+    ):
+        raise ValueError(f"Invalid retriever feature shape in {path}: {features.shape}")
+    if len(set(patch_ids)) != len(patch_ids):
+        raise ValueError(f"Duplicate patch IDs in retriever HDF5: {path}")
+    if expected_patch_ids is not None and patch_ids != expected_patch_ids:
+        raise RuntimeError(f"Retriever HDF5 patch order mismatch: {path}")
+    if (
+        expected_manifest_sha256 is not None
+        and attrs.get("patch_manifest_sha256") != expected_manifest_sha256
+    ):
+        raise RuntimeError(f"Retriever HDF5 patch manifest hash mismatch: {path}")
+    if (
+        expected_input_fingerprint_sha256 is not None
+        and attrs.get("input_fingerprint_sha256")
+        != expected_input_fingerprint_sha256
+    ):
+        raise RuntimeError(f"Retriever HDF5 WSI fingerprint mismatch: {path}")
+    if not np.isfinite(features).all():
+        raise ValueError(f"Non-finite retriever feature in {path}")
+    norms = np.linalg.norm(features, axis=1)
+    if np.any(np.abs(norms - 1.0) > 1e-5):
+        worst = float(np.max(np.abs(norms - 1.0)))
+        raise ValueError(
+            f"Retriever features are not unit normalized in {path}; worst_error={worst}"
+        )
+    return patch_ids, features, attrs
 
 
 def load_binary_mask(path: str | Path) -> np.ndarray:
@@ -223,7 +382,7 @@ def rank_focus_candidates_c(
                 "patch_id": candidate_id,
                 "candidate_index": index,
                 "candidate_class": candidate_class,
-                "plip_score": float(score),
+                "retriever_score": float(score),
                 "ambiguous_risk": risk,
                 "adjusted_score": adjusted_score,
                 "eligible": not hard_rejection_reasons,
@@ -235,7 +394,7 @@ def rank_focus_candidates_c(
     eligible_rows.sort(
         key=lambda row: (
             row["adjusted_score"],
-            row["plip_score"],
+            row["retriever_score"],
             -row["candidate_index"],
         ),
         reverse=True,

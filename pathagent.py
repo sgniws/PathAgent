@@ -15,12 +15,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="WSI-VQA Inference Pipeline")
 
     # --- Library Paths ---
-    parser.add_argument("--plip_lib_path", type=str, required=True,
+    parser.add_argument("--plip_lib_path", type=str, default=None,
                         help="Path to the PLIP library directory")
+    parser.add_argument(
+        "--retriever_backend",
+        choices=["plip", "conch_v1"],
+        default="plip",
+        help="Navigator image-text retriever; PLIP remains the backward-compatible default",
+    )
+    parser.add_argument("--retriever_lib_path", type=str, default=None)
+    parser.add_argument("--retriever_checkpoint", type=str, default=None)
+    parser.add_argument("--retriever_feature_dir", type=str, default=None)
 
     # --- Model Checkpoints ---
     parser.add_argument("--executor_provider", choices=["qwen", "deepseek"], default="qwen",
-                        help="Provider used only for the text Executor; PLIP and Patho-R1 remain unchanged")
+                        help="Provider used only for the text Executor; Retriever and Patho-R1 remain unchanged")
     parser.add_argument("--executor_env_file", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "api.env"),
                         help="Local KEY=VALUE file used by the DeepSeek provider; never written to traces")
@@ -36,6 +45,13 @@ def parse_args():
                         help="Stop before another API request after this estimated RMB budget is exhausted")
     parser.add_argument("--executor_max_consecutive_failures", type=int, default=2)
     parser.add_argument("--executor_max_failure_rate", type=float, default=0.05)
+    parser.add_argument("--executor_shared_state", type=str, default=None,
+                        help="Optional inter-process DeepSeek budget and circuit-breaker JSON state")
+    parser.add_argument("--executor_retry_schedule_seconds", type=float, nargs=3,
+                        default=(2.0, 3.0, 5.0), metavar=("CONNECT", "SERVER", "DISCONNECT"),
+                        help="Shared retry waits for connection, 5xx, and timeout/disconnect failures")
+    parser.add_argument("--executor_required_returned_model", type=str, default=None,
+                        help="Optional exact response model identity hard gate")
     parser.add_argument("--qwen_ckpt", type=str, default=None,
                         help="Path to Qwen checkpoint; required only for --executor_provider=qwen")
     parser.add_argument("--qwen_backend", type=str, default="auto",
@@ -47,11 +63,10 @@ def parse_args():
                         help="API key for the OpenAI-compatible Qwen endpoint")
     parser.add_argument("--qwen_api_model", type=str, default=None,
                         help="Model name exposed by the OpenAI-compatible Qwen endpoint")
-    parser.add_argument("--plip_ckpt", type=str, required=True,
+    parser.add_argument("--plip_ckpt", type=str, default=None,
                         help="Path to PLIP checkpoint")
     parser.add_argument("--patho_r1_ckpt", type=str, required=True,
                         help="Path to Patho-R1 checkpoint")
-
     # --- Data Files ---
     parser.add_argument("--descriptions_file", type=str, default=None,
                         help="Optional patch descriptions JSON; WSI backend can start with empty descriptions")
@@ -65,22 +80,22 @@ def parse_args():
         "--zoom_backend",
         choices=["wsi", "legacy_jpeg"],
         required=True,
-        help="Explicit evidence backend; legacy_jpeg never activates silently.",
+        help="Explicit evidence backend. WSI is required for the new pancreatic pilot; legacy_jpeg never activates silently.",
     )
     parser.add_argument("--wsi_manifest", type=str, default=None,
                         help="WSI backend: JSONL containing slide_id and original slide_path")
     parser.add_argument("--patch_manifest_dir", type=str, default=None,
                         help="WSI backend: directory containing one selected/rejected patch manifest per slide")
     parser.add_argument("--feature_h5_dir", type=str, default=None,
-                        help="WSI backend: directory containing one versioned PLIP HDF5 per slide")
+                        help="Legacy alias for the WSI PLIP HDF5 directory")
     parser.add_argument(
         "--focus_tissue_mask_dirs",
         type=str,
         nargs="*",
         default=None,
         help=(
-            "WSI backend: GrandQC mask directories; masks must be named "
-            "<slide_id>.grandqc.png"
+            "WSI backend: optional GrandQC mask directories searched before the pilot-relative "
+            "dev/test defaults; masks must be named <slide_id>.grandqc.png"
         ),
     )
     parser.add_argument("--save_dir", type=str, required=True,
@@ -97,7 +112,7 @@ def parse_args():
                         choices=[784],
                         help="Frozen Patho-R1 WSI observation canvas; only 784x784 is permitted")
     parser.add_argument("--focus_parent_top_k", type=int, default=2,
-                        help="Number of observed 5x parents entering one focus candidate pool")
+                        help="Number of observed 5x parents entering one focus candidate pool; remains configurable for later ablation")
     parser.add_argument(
         "--patho_prompt_version",
         type=str,
@@ -122,10 +137,20 @@ def parse_args():
     parser.add_argument("--initial_sample_ratio", type=float, default=0.10)
     parser.add_argument("--replenish_ratio", type=float, default=0.05)
     parser.add_argument(
+        "--experiment_policy",
+        choices=["full_loop", "no_zoom", "one_shot"],
+        default="full_loop",
+        help=(
+            "Controlled policy arm for agent-loop ablations. full_loop preserves the production policy; "
+            "no_zoom permits retrieval/inspection but normalizes zoom requests; one_shot returns the "
+            "general_v2 benchmark answer after the initial retriever pass."
+        ),
+    )
+    parser.add_argument(
         "--initial_top_k",
         type=int,
         default=None,
-        help="Optional fixed number of initial PLIP patches; overrides --initial_sample_ratio when set.",
+        help="Optional fixed number of initial retriever patches; overrides --initial_sample_ratio when set.",
     )
     parser.add_argument(
         "--replenish_top_k",
@@ -177,16 +202,16 @@ def parse_args():
 # --- 1. Parse Arguments First ---
 args = parse_args()
 
-# --- 2. Dynamic Path Insertion ---
-if not os.path.exists(args.plip_lib_path):
-    raise FileNotFoundError(f"PLIP library path not found: {args.plip_lib_path}")
+# --- 2. Resolve the model-agnostic retriever configuration ---
+from models.retrievers import resolve_retriever_args
 
-sys.path.insert(0, args.plip_lib_path)
-from plip import PLIP
+args = resolve_retriever_args(args)
+
 from data_processing.utils import *
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from models.llm_backend import load_llm_backend
 from models.inference import evaluate_with_llm_chain, slide_llm_answer, patho_r1_describe, summarize_patches_in_chunks
+from models.retrievers import create_retriever
 
 def main():
     if args.executor_protocol in {"general_v2", "pancreatic_v2"}:
@@ -194,18 +219,23 @@ def main():
 
         return run_pancreatic_v2(
             args,
-            plip_class=PLIP,
+            retriever_factory=create_retriever,
             patho_model_class=Qwen2_5_VLForConditionalGeneration,
             patho_processor_class=AutoProcessor,
         )
+
+    if args.retriever_backend != "plip":
+        raise ValueError("The legacy protocol supports only the PLIP retriever")
+    sys.path.insert(0, args.retriever_lib_path)
+    from plip import PLIP
 
     # Ensure save directory exists
     os.makedirs(args.save_dir, exist_ok=True)
 
     print("="*40)
-    print(f"PLIP Lib:   {args.plip_lib_path}")
+    print(f"PLIP Lib:   {args.retriever_lib_path}")
     print(f"Model Qwen: {args.qwen_ckpt}")
-    print(f"Model PLIP: {args.plip_ckpt}")
+    print(f"Model PLIP: {args.retriever_checkpoint}")
     print(f"Model PR1:  {args.patho_r1_ckpt}")
     print(f"Dataset:    {args.dataset_name}")
     print(f"Results to: {args.save_dir}")
@@ -237,11 +267,14 @@ def main():
         api_max_attempts=args.executor_api_max_attempts,
         request_char_limit=args.executor_request_char_limit,
         budget_rmb=args.executor_budget_rmb,
+        shared_state_path=args.executor_shared_state,
+        retry_schedule_seconds=tuple(args.executor_retry_schedule_seconds),
+        required_returned_model=args.executor_required_returned_model,
     )
     print(f"Executor loaded successfully: provider={args.executor_provider}, backend={args.qwen_backend}.")
 
     # PLIP
-    plip = PLIP(args.plip_ckpt)
+    plip = PLIP(args.retriever_checkpoint)
     print("PLIP model loaded successfully.")
 
     # Patho-R1
