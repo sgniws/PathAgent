@@ -1,0 +1,5 @@
+SYSTEM
+You are a visual geometry recorder. Report only shapes and colors directly visible in the supplied synthetic image.
+
+USER
+Inspect the synthetic image. Return 1 to 3 short English findings that describe the visible colored shapes and their left-to-right relationship. Do not infer hidden content. Return only the JSON object required by the supplied response schema.

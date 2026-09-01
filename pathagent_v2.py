@@ -41,6 +41,8 @@ from data_processing.wsi_pyramid import (
     resolve_wsi_input_fingerprint,
 )
 from models.inference import (
+    R16_INSPECT_FOCUS_PROMPT_VERSION,
+    build_r16_patho_prompt,
     build_general_executor_system_prompt,
     evaluate_general_vqa_action,
     evaluate_pancreatic_vqa_action,
@@ -725,7 +727,14 @@ def _describe_patch(
 ):
     patch_geometry = (evidence_metadata or {}).get(patch_name, {})
     effective_focus = inspection_focus or GENERIC_MORPHOLOGY_FOCUS
-    actual_user_prompt = None
+    if getattr(args, "patho_output_contract", "base") == "r16_benchmark_v1":
+        _, actual_user_prompt = build_r16_patho_prompt(
+            prompt_version=args.patho_prompt_version,
+            operation=operation,
+            inspection_focus=effective_focus,
+        )
+    else:
+        actual_user_prompt = None
     cache_payload = {
         "cache_schema": "patho_morphology_cache_v3",
         "prompt_version": args.patho_prompt_version,
@@ -820,7 +829,9 @@ def _describe_patch(
         choices=choices,
         morphology_only=True,
         inspection_focus=effective_focus,
+        raw_inspection_focus=raw_inspection_focus,
         prompt_version=args.patho_prompt_version,
+        output_contract=getattr(args, "patho_output_contract", "base"),
         trace_recorder=recorder,
         trace_context={"step_id": step_id, "attempt": attempt},
         patch_id=patch_name,
@@ -860,6 +871,13 @@ def run_pancreatic_v2(args, retriever_factory, patho_model_class, patho_processo
         raise ValueError("--rollouts_per_question must be at least 1")
     if args.focus_parent_top_k < 1:
         raise ValueError("--focus_parent_top_k must be at least 1")
+    if getattr(args, "patho_output_contract", "base") == "r16_benchmark_v1":
+        if not getattr(args, "patho_lora_adapter", None):
+            raise ValueError("r16_benchmark_v1 requires --patho_lora_adapter")
+        if args.patho_prompt_version not in {"r16_benchmark_v1", R16_INSPECT_FOCUS_PROMPT_VERSION} or args.patho_max_new_tokens != 512:
+            raise ValueError("r16_benchmark_v1 requires a supported r16 prompt version and max_new_tokens=512")
+        if getattr(args, "prefer_precomputed_descriptions", False):
+            raise ValueError("r16_benchmark_v1 forbids Base precomputed descriptions")
     if zoom_backend == "wsi":
         required_wsi_args = {
             "--wsi_manifest": args.wsi_manifest,
@@ -956,10 +974,23 @@ def run_pancreatic_v2(args, retriever_factory, patho_model_class, patho_processo
     patho_model = None
     patho_processor = None
     if not args.disable_patho_r1_runtime:
-        patho_model = patho_model_class.from_pretrained(
-            args.patho_r1_ckpt, torch_dtype="auto", device_map="auto"
-        )
-        patho_processor = patho_processor_class.from_pretrained(args.patho_r1_ckpt)
+        if getattr(args, "patho_output_contract", "base") == "r16_benchmark_v1":
+            from patho_lora_sft.common import directory_fingerprint
+            from patho_lora_sft.production import load_r16_production_candidate
+
+            adapter_path = Path(args.patho_lora_adapter or "").resolve()
+            expected_adapter_sha = str(args.patho_lora_adapter_sha256 or "")
+            actual_adapter = directory_fingerprint(adapter_path)
+            if not expected_adapter_sha or actual_adapter["sha256"] != expected_adapter_sha:
+                raise RuntimeError("r16 adapter fingerprint does not match the frozen benchmark contract")
+            patho_model, patho_processor = load_r16_production_candidate(
+                base_path=Path(args.patho_r1_ckpt).resolve(), adapter_path=adapter_path
+            )
+        else:
+            patho_model = patho_model_class.from_pretrained(
+                args.patho_r1_ckpt, torch_dtype="auto", device_map="auto"
+            )
+            patho_processor = patho_processor_class.from_pretrained(args.patho_r1_ckpt)
 
     all_descriptions = (
         json.loads(Path(args.descriptions_file).read_text(encoding="utf-8"))

@@ -1,0 +1,40 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "patho_paired_morphology_evaluation_v1",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_a", "candidate_b", "preference"],
+      "properties": {
+        "candidate_a": {"$ref": "#/$defs/candidate"},
+        "candidate_b": {"$ref": "#/$defs/candidate"},
+        "preference": {"type": "string", "enum": ["A", "B", "tie"]}
+      },
+      "$defs": {
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["claims", "forbidden_inference"],
+          "properties": {
+            "claims": {
+              "type": "array",
+              "maxItems": 5,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["claim", "status"],
+                "properties": {
+                  "claim": {"type": "string", "minLength": 1},
+                  "status": {"type": "string", "enum": ["supported", "unsupported", "not_assessable"]}
+                }
+              }
+            },
+            "forbidden_inference": {"type": "boolean"}
+          }
+        }
+      }
+    }
+  }
+}

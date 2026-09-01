@@ -288,6 +288,15 @@ python -m pytest -q
 
 部分数据准备脚本需要额外环境，例如 OpenCV、`segmentation-models-pytorch`、Trident、CLAM、Quilt-LLaVA 或 COCO caption evaluation。它们不属于核心推理依赖，应按照相应上游项目单独安装。不要把第三方源码、模型权重或数据集直接复制进本仓库。
 
+形态学 SFT 工具包可以独立安装：
+
+```bash
+python -m pip install -e '.[sft-test]'
+python -m pytest -q tests/test_patho_lora_s0_s1.py tests/test_patho_lora_s0_s1_failures.py
+```
+
+训练环境另外安装 `.[sft-train]`。公开配置只在 `configs/sft/` 提供示例；真实 manifest、哈希、模型路径、API 账户信息和训练产物必须保存在 Git 忽略的私有目录。
+
 ## 数据隐私与发布安全
 
 - `api.env`、`.env*`、模型权重、WSI、HDF5/NumPy 特征、运行结果和缓存不应进入 Git；

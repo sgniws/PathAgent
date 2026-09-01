@@ -6,9 +6,13 @@ import torch
 from PIL import Image
 
 from copy import deepcopy
+from typing import Optional
 from qwen_vl_utils import process_vision_info
 from data_processing.utils import extract_coords_from_name, build_descriptions_with_meta
 from models.llm_backend import generate_chat_text, strip_thinking_block
+from patho_lora_sft.common import canonical_json
+from patho_lora_sft.constrained import constrained_generation_kwargs
+from patho_lora_sft.schema import parse_wrapped_findings
 
 PANCREATIC_EXECUTOR_SYSTEM_PROMPT = (
     "You are the Executor of a pancreatic histopathology WSI agent. "
@@ -43,9 +47,72 @@ GENERAL_EXECUTOR_SYSTEM_PROMPT = (
     "Use concise auditable evidence summaries and patch identifiers; do not output hidden reasoning or a thinking block."
 )
 
+EVIDENCE_HANDLE_PROTOCOL_INSTRUCTION = (
+    "The current state's visible_patch_ids are opaque evidence handles such as E01 and E02. "
+    "In evidence_refs and next_action.target_patches, copy only exact handles currently listed in visible_patch_ids. "
+    "Never reconstruct a coordinate-based patch identifier, alter a handle, omit characters, or cite a handle from an earlier "
+    "state unless it remains in the current visible_patch_ids list. The local environment resolves valid handles to internal patch IDs."
+)
+
 ALLOWED_AGENT_ACTIONS = {"retrieve", "inspect", "zoom", "answer", "abstain"}
 PATHO_MORPHOLOGY_PROMPT_VERSION = "pancreatic_morphology_v4"
 FROZEN_PATHO_R1_CANVAS = (784, 784)
+R16_BASE_PROMPT_VERSION = "r16_benchmark_v1"
+R16_INSPECT_FOCUS_PROMPT_VERSION = "r16_inspect_focus_v1"
+R16_PATHO_SYSTEM_PROMPT = (
+    "You are a pathology image morphology recorder. Report only morphology directly visible in the supplied H&E image. "
+    "Do not provide a diagnosis, organ prediction, tumor category, clinical interpretation, immunohistochemistry, "
+    "molecular claim, treatment recommendation, or prognosis. The final user-visible answer must contain exactly one "
+    "JSON object and no additional text."
+)
+R16_BASE_USER_PROMPT = (
+    "Inspect this H&E patch and return only the most visually salient and confidently observed morphology. "
+    "Return exactly one JSON object inside <answer>...</answer>. The object must contain exactly one key named findings; "
+    "findings must be an array of 0 to 5 non-empty English strings. Each string must describe one short morphology "
+    "observation directly visible in this image. Do not report anything absent, not seen, uncertain, inferred, or not "
+    "assessable. Do not provide a diagnosis, organ name, tumor category, explanation, recommendation, or prognosis. "
+    "If no reliable direct morphology is visible, use an empty array. Do not output Markdown or a code fence. "
+    "Punctuation-only example: <answer>{\"findings\":[]}</answer>. Return exactly one <answer> block and nothing else."
+)
+R16_FINDINGS_OUTPUT_INSTRUCTION = (
+    "Return exactly one JSON object inside <answer>...</answer>. The object must contain exactly one key named findings; "
+    "findings must be an array of 0 to 5 non-empty English strings. Each string must describe one short morphology "
+    "observation directly visible in this image. Do not report anything absent, not seen, uncertain, inferred, or not "
+    "assessable. Do not provide a diagnosis, organ name, tumor category, explanation, recommendation, or prognosis. "
+    "If no reliable direct morphology is visible, use an empty array. Do not output Markdown or a code fence. "
+    "Punctuation-only example: <answer>{\"findings\":[]}</answer>. Return exactly one <answer> block and nothing else."
+)
+
+
+def build_r16_patho_prompt(
+    *,
+    prompt_version: str,
+    operation: str,
+    inspection_focus: Optional[str],
+) -> tuple[str, str]:
+    """Return the exact deployed r16 system and user prompts.
+
+    The historical prompt version remains immutable.  The versioned focus
+    prompt differs only for an Executor-requested inspect; retrieve and zoom
+    deliberately return the historical user prompt byte-for-byte.
+    """
+    if prompt_version == R16_BASE_PROMPT_VERSION:
+        return R16_PATHO_SYSTEM_PROMPT, R16_BASE_USER_PROMPT
+    if prompt_version != R16_INSPECT_FOCUS_PROMPT_VERSION:
+        raise ValueError(f"unsupported r16 prompt version: {prompt_version}")
+    if operation != "executor_requested_inspect":
+        return R16_PATHO_SYSTEM_PROMPT, R16_BASE_USER_PROMPT
+    focus = str(inspection_focus or "").strip()
+    if not focus:
+        raise ValueError("r16 inspect focus prompt requires a non-empty sanitized focus")
+    user_prompt = (
+        "Inspect this H&E patch with special attention to the following visible morphology target:\n\n"
+        f"{focus}\n\n"
+        "Report only morphology directly visible in this image. Do not infer a diagnosis or report the requested "
+        "feature unless it is confidently visible.\n\n"
+        + R16_FINDINGS_OUTPUT_INSTRUCTION
+    )
+    return R16_PATHO_SYSTEM_PROMPT, user_prompt
 
 
 def prepare_patho_r1_canvas(image):
@@ -309,11 +376,13 @@ def evaluate_pancreatic_vqa_action(
     system_prompt = (
         PANCREATIC_EXECUTOR_SYSTEM_PROMPT
         + "\n"
+        + EVIDENCE_HANDLE_PROTOCOL_INSTRUCTION
+        + "\n"
         + answer_contract
         + "\nReturn exactly one JSON object with this schema:\n"
         + "{\n"
         + '  "candidate_answer": "one choice or Insufficient evidence",\n'
-        + '  "evidence_refs": ["at most 8 patch identifiers"],\n'
+        + '  "evidence_refs": ["at most 8 exact currently visible evidence handles"],\n'
         + '  "evidence_summary": "at most 3 brief sentences about visible evidence",\n'
         + '  "sufficient": true,\n'
         + '  "missing_evidence": "brief description or empty string",\n'
@@ -401,6 +470,8 @@ def build_general_executor_system_prompt(evidence_policy="model_v1"):
     )
     return (
         GENERAL_EXECUTOR_SYSTEM_PROMPT
+        + "\n"
+        + EVIDENCE_HANDLE_PROTOCOL_INSTRUCTION
         + "\nReturn exactly one JSON object with this schema:\n"
         + "{\n"
         + '  "provisional_recommendation": "one exact official choice",\n'
@@ -410,7 +481,7 @@ def build_general_executor_system_prompt(evidence_policy="model_v1"):
         + sufficiency_schema
         + '  "abstain_recommended": false,\n'
         + '  "unsupported_answer_reason": "brief reason or empty string",\n'
-        + '  "evidence_refs": ["at most 8 currently visible patch identifiers"],\n'
+        + '  "evidence_refs": ["at most 8 exact currently visible evidence handles"],\n'
         + '  "evidence_summary": "at most 3 brief sentences about direct visible evidence",\n'
         + '  "missing_evidence": "brief morphology target or empty string",\n'
         + '  "next_action": {"type": "retrieve|inspect|zoom|answer|abstain", "query": "", '
@@ -879,10 +950,30 @@ def patho_r1_describe(image, question=None,
                     patho_r1_processor=None, patho_r1_model=None,
                     coords=None, magnification=None, max_new_tokens=1024, choices=None, missing_info=None,
                     trace_recorder=None, trace_context=None, patch_id=None, operation="patho_r1_describe",
-                    morphology_only=False, inspection_focus=None,
-                    prompt_version=PATHO_MORPHOLOGY_PROMPT_VERSION):
+                    morphology_only=False, inspection_focus=None, raw_inspection_focus=None,
+                    prompt_version=PATHO_MORPHOLOGY_PROMPT_VERSION,
+                    output_contract="base"):
 
     image = prepare_patho_r1_canvas(image)
+
+    constrained_r16 = output_contract == "r16_benchmark_v1"
+    if constrained_r16:
+        if not morphology_only or question is not None or max_new_tokens != 512:
+            raise ValueError("r16_benchmark_v1 requires morphology-only, question-blind, 512-token generation")
+        if prompt_version not in {R16_BASE_PROMPT_VERSION, R16_INSPECT_FOCUS_PROMPT_VERSION} or image.mode != "RGB":
+            raise ValueError("r16_benchmark_v1 prompt or RGB input contract changed")
+        system_prompt, prompt_body = build_r16_patho_prompt(
+            prompt_version=prompt_version,
+            operation=operation,
+            inspection_focus=inspection_focus,
+        )
+        full_text = prompt_body
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt_body}]},
+        ]
+    else:
+        system_prompt = None
 
     meta_lines = []
     if coords is not None:
@@ -894,7 +985,9 @@ def patho_r1_describe(image, question=None,
         meta_text = "[IMAGE META] " + " | ".join(meta_lines) + "\n\n"
 
 
-    if morphology_only:
+    if constrained_r16:
+        pass
+    elif morphology_only:
         focus = inspection_focus or question or "Identify the most informative visible histologic architecture."
         prompt_body = (
             "This is a visual transcription task, not a diagnostic task. Describe only morphology directly visible in this H&E patch. "
@@ -942,10 +1035,12 @@ def patho_r1_describe(image, question=None,
     if missing_info is not None and not morphology_only:
         prompt_body += f"\nMissing information: {missing_info}"
 
-    full_text = meta_text + prompt_body
+    if not constrained_r16:
+        full_text = meta_text + prompt_body
 
     # === Construct system prompt ===
-    system_prompt = (
+    if not constrained_r16:
+        system_prompt = (
         "A conversation between a curious user and an AI medical assistant specialized in pathology image analysis. "
         "The assistant can interpret pathology images, describe observed features, and provide possible explanations based on medical knowledge, "
         "but will never give a definitive diagnosis or prescribe treatment. "
@@ -955,7 +1050,7 @@ def patho_r1_describe(image, question=None,
         "If choices are given, the answer must be given from the choices."
         "If Missing information is given, you need to focus on this part of the image."
     )
-    if morphology_only:
+    if morphology_only and not constrained_r16:
         system_prompt = (
             "You are a pathology image morphology recorder. Report only directly visible H&E morphology and image quality. "
             "Do not provide a diagnosis, organ prediction, tumor category, candidate answer, clinical interpretation, "
@@ -963,16 +1058,17 @@ def patho_r1_describe(image, question=None,
         )
 
     # === Construct message input ===
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": full_text},
-            ],
-        },
-    ]
+    if not constrained_r16:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": full_text},
+                ],
+            },
+        ]
 
     context = trace_context or {}
     call_id = None
@@ -993,7 +1089,10 @@ def patho_r1_describe(image, question=None,
                 "missing_info": missing_info,
                 "morphology_only": morphology_only,
                 "inspection_focus": inspection_focus,
+                "inspection_focus_raw": raw_inspection_focus,
+                "inspection_focus_sanitized": inspection_focus,
                 "prompt_version": prompt_version,
+                "output_contract": output_contract,
                 "max_new_tokens": max_new_tokens,
                 "observation_canvas": list(FROZEN_PATHO_R1_CANVAS),
                 "prompt": full_text,
@@ -1007,8 +1106,13 @@ def patho_r1_describe(image, question=None,
         inputs = patho_r1_processor(
             text=[text], images=image_inputs, padding=True, return_tensors="pt"
         ).to(patho_r1_model.device)
+        generation_kwargs = {"max_new_tokens": max_new_tokens}
+        if constrained_r16:
+            generation_kwargs.update(
+                constrained_generation_kwargs(patho_r1_processor.tokenizer, [int(inputs.input_ids.shape[1])])
+            )
         with torch.no_grad():
-            generated_ids = patho_r1_model.generate(**inputs, max_new_tokens=max_new_tokens)
+            generated_ids = patho_r1_model.generate(**inputs, **generation_kwargs)
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -1017,7 +1121,13 @@ def patho_r1_describe(image, question=None,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0].strip()
-        visible_output = (
+        if constrained_r16:
+            parsed = parse_wrapped_findings(output_text)
+            if not parsed.valid:
+                raise ValueError(f"r16_benchmark_v1 Schema failure: {parsed.error}")
+            visible_output = canonical_json({"findings": list(parsed.findings)})
+        else:
+            visible_output = (
             normalize_patho_morphology_output(
                 output_text,
                 forbidden_labels=choices,
@@ -1025,7 +1135,7 @@ def patho_r1_describe(image, question=None,
             )
             if morphology_only
             else normalize_patho_r1_output(output_text, choices=choices)
-        )
+            )
         del inputs, generated_ids, generated_ids_trimmed, image_inputs, video_inputs
         torch.cuda.empty_cache()
         if trace_recorder is not None:

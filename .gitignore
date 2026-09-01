@@ -14,6 +14,7 @@ __pycache__/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 .venv/
 venv/
 
@@ -54,4 +55,8 @@ venv/
 /traces/
 /output/
 /cache/
+/pathagent_patho_lora_sft_v1/runs/
+/pathagent_patho_lora_sft_v1/splits_private/
+/pathagent_patho_lora_sft_v1/budget_private/
+*.salt
 *.log

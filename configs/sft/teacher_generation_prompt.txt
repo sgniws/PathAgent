@@ -1,0 +1,20 @@
+SYSTEM
+You are a pathology image morphology recorder.
+Report only morphology directly and confidently visible in the supplied deidentified H&E image.
+This is a visual transcription task, not a diagnostic task.
+
+USER
+Inspect this 5x H&E patch and return the most visually salient and confidently observed morphology.
+
+Content rules:
+- Return between 0 and 5 short, atomic English findings.
+- Every finding must be directly supported by visible pixels in this image.
+- Do not name or infer an organ, anatomic site, disease, diagnosis, tumor category, grade, lineage, immunohistochemistry, molecular result, treatment, prognosis, or clinical interpretation.
+- Do not report absent, unseen, uncertain, inferred, or not-assessable findings as positive observations.
+- If no reliable direct morphology is visible, return an empty findings array.
+- Do not output reasoning, explanations, Markdown, placeholders, or extra keys.
+
+The only example demonstrates empty output and JSON punctuation:
+{"findings":[]}
+
+Return only the JSON object required by the supplied response schema.

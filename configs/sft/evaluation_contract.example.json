@@ -1,0 +1,22 @@
+{
+  "schema_version": "pathagent_sft_evaluation_contract_example_v1",
+  "experiment_id": "REPLACE_WITH_LOCAL_EXPERIMENT_ID",
+  "native_metric": "native_schema_valid",
+  "deployed_metric": "deployed_schema_valid",
+  "constrained_output_is_native": false,
+  "test_data_authorized": false,
+  "external_judges": {
+    "allow_fallbacks": false,
+    "require_exact_model_and_provider": true,
+    "data_collection": "deny",
+    "save_request_bodies": false,
+    "save_image_base64": false
+  },
+  "hard_gates": {
+    "schema": true,
+    "safety": true,
+    "truthfulness": true,
+    "description_preference": true,
+    "isolation_and_rollback": true
+  }
+}
