@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import time
 from copy import deepcopy
 from datetime import datetime
@@ -31,11 +32,13 @@ from data_processing.wsi_pyramid import (
     image_white_fraction,
     load_binary_mask,
     load_patch_manifest,
-    load_plip_h5,
+    load_retriever_h5,
     load_wsi_manifest,
     mask_fraction_for_region,
     partition_region,
     rank_focus_candidates_c,
+    retriever_feature_filename,
+    resolve_wsi_input_fingerprint,
 )
 from models.inference import (
     build_general_executor_system_prompt,
@@ -44,7 +47,11 @@ from models.inference import (
     patho_r1_describe,
     sanitize_morphology_evidence_text,
 )
-from models.retrieval_policy import initial_retrieval_count, replenishment_count
+from models.experiment_policy import (
+    initial_retrieval_count,
+    normalize_experiment_action,
+    replenishment_count,
+)
 from models.evidence_contract import (
     OUTPUT_SCHEMA_VERSION,
     candidate_record,
@@ -61,6 +68,7 @@ from models.llm_backend import (
     detect_checkpoint_family,
     load_llm_backend,
 )
+from models.retrieval_query import initial_retrieval_query as _initial_retrieval_query
 from models.trace_recorder import TraceRecorder
 
 
@@ -240,18 +248,31 @@ def _sampling(args, rollout_id: int) -> dict[str, Any]:
     }
 
 
-def _plip_text(plip, text: str, recorder: TraceRecorder, operation: str, step_id: int, attempt: int):
+def _retriever_text(retriever, text: str, recorder: TraceRecorder, operation: str, step_id: int, attempt: int):
+    request = {
+        "backend": retriever.spec.backend,
+        "model_id": retriever.spec.model_id,
+        "text": text,
+        "batch_size": 1,
+    }
     call_id = recorder.before_call(
-        "plip", operation, {"text": text, "batch_size": 1}, step_id=step_id, attempt=attempt
+        "retriever", operation, request, step_id=step_id, attempt=attempt
     )
     started = time.time()
     try:
-        embedding = plip.encode_text([text], batch_size=1)
+        embedding = retriever.encode_text([text], batch_size=1)
         recorder.after_call(
             call_id,
-            "plip",
+            "retriever",
             operation,
-            {"shape": list(np.asarray(embedding).shape), "latency_ms": round((time.time() - started) * 1000)},
+            {
+                "backend": retriever.spec.backend,
+                "model_id": retriever.spec.model_id,
+                "shape": list(np.asarray(embedding).shape),
+                "dtype": str(np.asarray(embedding).dtype),
+                "normalized": True,
+                "latency_ms": round((time.time() - started) * 1000),
+            },
             step_id=step_id,
             attempt=attempt,
         )
@@ -259,9 +280,13 @@ def _plip_text(plip, text: str, recorder: TraceRecorder, operation: str, step_id
     except Exception as exc:
         recorder.after_call(
             call_id,
-            "plip",
+            "retriever",
             operation,
-            {"latency_ms": round((time.time() - started) * 1000)},
+            {
+                "backend": retriever.spec.backend,
+                "model_id": retriever.spec.model_id,
+                "latency_ms": round((time.time() - started) * 1000),
+            },
             status="error",
             error=f"{type(exc).__name__}: {exc}",
             step_id=step_id,
@@ -270,22 +295,35 @@ def _plip_text(plip, text: str, recorder: TraceRecorder, operation: str, step_id
         raise
 
 
-def _plip_images(plip, images, image_ids, recorder, operation, step_id, attempt):
+def _retriever_images(retriever, images, image_ids, recorder, operation, step_id, attempt):
     call_id = recorder.before_call(
-        "plip",
+        "retriever",
         operation,
-        {"image_ids": image_ids, "batch_size": 4},
+        {
+            "backend": retriever.spec.backend,
+            "model_id": retriever.spec.model_id,
+            "image_ids": image_ids,
+            "batch_size": 4,
+            "input_size": retriever.spec.input_size,
+        },
         step_id=step_id,
         attempt=attempt,
     )
     started = time.time()
     try:
-        embeddings = plip.encode_images(images, batch_size=4)
+        embeddings = retriever.encode_images(images, batch_size=4)
         recorder.after_call(
             call_id,
-            "plip",
+            "retriever",
             operation,
-            {"shape": list(np.asarray(embeddings).shape), "latency_ms": round((time.time() - started) * 1000)},
+            {
+                "backend": retriever.spec.backend,
+                "model_id": retriever.spec.model_id,
+                "shape": list(np.asarray(embeddings).shape),
+                "dtype": str(np.asarray(embeddings).dtype),
+                "normalized": True,
+                "latency_ms": round((time.time() - started) * 1000),
+            },
             step_id=step_id,
             attempt=attempt,
         )
@@ -293,9 +331,13 @@ def _plip_images(plip, images, image_ids, recorder, operation, step_id, attempt)
     except Exception as exc:
         recorder.after_call(
             call_id,
-            "plip",
+            "retriever",
             operation,
-            {"latency_ms": round((time.time() - started) * 1000)},
+            {
+                "backend": retriever.spec.backend,
+                "model_id": retriever.spec.model_id,
+                "latency_ms": round((time.time() - started) * 1000),
+            },
             status="error",
             error=f"{type(exc).__name__}: {exc}",
             step_id=step_id,
@@ -310,15 +352,20 @@ def _rank(names: list[str], embeddings: np.ndarray, query_embedding: np.ndarray)
     return [(names[int(index)], float(similarities[int(index)])) for index in order]
 
 
-def _resolve_focus_tissue_mask_path(args, slide_id: str) -> Path:
-    configured_dirs = getattr(args, "focus_tissue_mask_dirs", None) or []
-    if isinstance(configured_dirs, (str, Path)):
-        configured_dirs = [configured_dirs]
-    search_dirs = [Path(value) for value in configured_dirs]
-    if not search_dirs:
-        raise ValueError(
-            "--focus_tissue_mask_dirs is required with --zoom_backend wsi"
-        )
+def _resolve_focus_tissue_mask_path(args, slide_id: str, split: str) -> Path:
+    explicit_dirs = getattr(args, "focus_tissue_mask_dirs", None) or []
+    if isinstance(explicit_dirs, (str, Path)):
+        explicit_dirs = [explicit_dirs]
+    pilot_root = Path(args.patch_manifest_dir).resolve().parent
+    split_dir = "threshold_tuning_v1" if split == "dev" else "test_frozen_filter_v1"
+    search_dirs = [Path(value) for value in explicit_dirs]
+    search_dirs.extend(
+        [
+            pilot_root / "qc" / split_dir / "masks",
+            pilot_root / "qc" / "threshold_tuning_v1" / "masks",
+            pilot_root / "qc" / "test_frozen_filter_v1" / "masks",
+        ]
+    )
     seen = set()
     for directory in search_dirs:
         resolved = directory.resolve()
@@ -334,32 +381,76 @@ def _resolve_focus_tissue_mask_path(args, slide_id: str) -> Path:
     )
 
 
-def _initial_retrieval_query(question: str) -> str:
-    return (
-        f"{question} "
-        "Retrieve lesional H&E regions with direct abnormal morphology: architectural distortion, infiltrative atypical "
-        "glands, desmoplastic stroma, papillary or pseudopapillary structures, solid tumor cells, mucin, necrosis, "
-        "or a tumor-stroma interface."
-    )
-
-
 def _safe_inspection_focus(text: str | None, choices: list[str]) -> str:
-    focus = str(text or "").strip()
-    lowered = focus.casefold()
-    diagnostic_terms = (
-        "tumor category",
-        "tumour category",
-        "adenocarcinoma",
-        "neoplasm",
-        "neuroendocrine",
-        "pseudopapillary",
-        "diagnosis",
-    )
-    if not focus or any(term in lowered for term in diagnostic_terms):
+    return _sanitize_inspection_focus(text, choices)
+
+
+_INSPECTION_FOCUS_MAX_CHARS = 240
+_FOCUS_DIAGNOSTIC_OR_ORGAN = re.compile(
+    r"\b(?:diagnos(?:is|tic)|tumou?r\s+(?:type|category)|adenocarcinoma|carcinoma|sarcoma|lymphoma|"
+    r"melanoma|neoplasm|neuroendocrine\s+(?:tumou?r|neoplasm)|solid\s+pseudopapillary\s+neoplasm|"
+    r"pancrea(?:s|tic)|breast|mammary|gastric|stomach|colorectal|colon|duoden(?:al|um)|liver|hepatic|"
+    r"lung|pulmonary|prostate|ovar(?:y|ian)|kidney|renal|brain|cerebral)\b",
+    flags=re.IGNORECASE,
+)
+_FOCUS_DIAGNOSTIC_OR_ORGAN_ZH = re.compile(
+    r"(?:诊断|胰腺|乳腺|胃|结直肠|结肠|十二指肠|肝|肺|前列腺|卵巢|肾|脑|"
+    r"腺癌|癌|肿瘤|肿瘤类别|肉瘤|淋巴瘤|黑色素瘤|神经内分泌肿瘤|实性假乳头状肿瘤)"
+)
+_FOCUS_ANSWER_LABEL = re.compile(
+    r"(?:^|[\s:;,])(?:answer|option|choice)\s*(?:is\s*)?[A-Z](?:\b|$)|^\s*[A-Z][.)]?\s*$",
+    flags=re.IGNORECASE,
+)
+_FOCUS_NONVISUAL = re.compile(
+    r"\b(?:immunohistochem|immunostain|molecular|mutation|prognos|treatment|therapy|survival|stage|"
+    r"margin|clinical|patient|report|label|answer|option|choice)\w*\b",
+    flags=re.IGNORECASE,
+)
+_FOCUS_MORPHOLOGY = re.compile(
+    r"\b(?:architect|gland|duct|papill|pseudopapill|solid|nest|trabec|cord|acinar|cell|nucle|cytoplas|"
+    r"stroma|desmoplas|fibro|collagen|mucin|necros|vessel|vascular|nerve|neural|inflamm|atyp|mito|"
+    r"artifact|hemorrhag|lumen|epithel|spindle|pleomorph|chromatin|nucleol|infiltrat|interface)\w*\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _sanitize_inspection_focus(
+    text: str | None,
+    choices: list[str],
+    *,
+    question: str | None = None,
+) -> str:
+    """Keep only a short, observable, label-blind morphology target."""
+    focus = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or ""))
+    focus = re.sub(r"\s+", " ", focus).strip()
+    if not focus:
         return GENERIC_MORPHOLOGY_FOCUS
-    for choice in choices:
-        focus = focus.replace(str(choice), "visible target morphology")
-    return focus
+    forbidden_full_texts = [str(value).strip() for value in choices if str(value).strip()]
+    if question and str(question).strip():
+        forbidden_full_texts.append(str(question).strip())
+    for forbidden in sorted(forbidden_full_texts, key=len, reverse=True):
+        focus = re.sub(re.escape(forbidden), " visible target morphology ", focus, flags=re.IGNORECASE)
+    focus = re.sub(r"\bE\d{1,4}\b", " ", focus, flags=re.IGNORECASE)
+    focus = re.sub(
+        r"\b(?:inspect|examine|evaluate|assess|look\s+for|focus\s+on)\b",
+        " ",
+        focus,
+        flags=re.IGNORECASE,
+    )
+    focus = re.sub(r"\bat\s+higher\s+magnification\b", " ", focus, flags=re.IGNORECASE)
+    focus = re.sub(r"\s+", " ", focus).strip(" -:;,.")
+    focus = re.sub(r"^to\s+", "", focus, flags=re.IGNORECASE)
+    if (
+        not focus
+        or _FOCUS_DIAGNOSTIC_OR_ORGAN.search(focus)
+        or _FOCUS_DIAGNOSTIC_OR_ORGAN_ZH.search(focus)
+        or _FOCUS_ANSWER_LABEL.search(focus)
+        or _FOCUS_NONVISUAL.search(focus)
+        or not _FOCUS_MORPHOLOGY.search(focus)
+    ):
+        return GENERIC_MORPHOLOGY_FOCUS
+    focus = focus[:_INSPECTION_FOCUS_MAX_CHARS].rstrip(" -:;,.\t")
+    return focus or GENERIC_MORPHOLOGY_FOCUS
 
 
 def _filter_visible_evidence_refs(decision: dict[str, Any], visible_patch_ids: list[str]) -> dict[str, Any]:
@@ -381,6 +472,105 @@ def _filter_visible_evidence_refs(decision: dict[str, Any], visible_patch_ids: l
             "dropped_invisible_refs": invalid_refs,
         }
     return decision
+
+
+class EvidenceHandleRegistry:
+    """Assign stable short Executor-facing handles to internal patch IDs.
+
+    Handles are scoped to one rollout, never reused, and deliberately contain
+    no coordinate fragments.  The environment and evidence contract continue
+    to use the original patch IDs after strict local resolution.
+    """
+
+    protocol = "short_handle_v1"
+
+    def __init__(self) -> None:
+        self._patch_to_handle: dict[str, str] = {}
+        self._handle_to_patch: dict[str, str] = {}
+
+    def register(self, patch_ids: list[str]) -> dict[str, str]:
+        for patch_id in patch_ids:
+            patch_id = str(patch_id)
+            if patch_id in self._patch_to_handle:
+                continue
+            handle = f"E{len(self._patch_to_handle) + 1:02d}"
+            self._patch_to_handle[patch_id] = handle
+            self._handle_to_patch[handle] = patch_id
+        return {
+            self._patch_to_handle[patch_id]: patch_id
+            for patch_id in patch_ids
+        }
+
+    def handle_for(self, patch_id: str) -> str:
+        return self._patch_to_handle[str(patch_id)]
+
+
+def _resolve_executor_evidence_handles(
+    decision: dict[str, Any],
+    visible_handle_map: dict[str, str],
+) -> tuple[dict[str, Any], list[Any]]:
+    """Strictly resolve model-facing handles without fuzzy ID correction.
+
+    The returned list preserves invalid model references for the deterministic
+    evidence contract, ensuring a malformed handle still makes the current
+    citation judgment invalid even though it is removed before execution.
+    """
+
+    raw_refs = decision.get("evidence_refs")
+    raw_refs = raw_refs if isinstance(raw_refs, list) else []
+    resolved_refs: list[str] = []
+    reported_patch_refs: list[Any] = []
+    invalid_refs: list[Any] = []
+    resolved_ref_records: list[dict[str, str]] = []
+    for handle in raw_refs:
+        patch_id = visible_handle_map.get(handle) if isinstance(handle, str) else None
+        if patch_id is None:
+            invalid_refs.append(handle)
+            reported_patch_refs.append(handle)
+            continue
+        reported_patch_refs.append(patch_id)
+        if patch_id not in resolved_refs:
+            resolved_refs.append(patch_id)
+            resolved_ref_records.append({"handle": handle, "patch_id": patch_id})
+    decision["evidence_refs"] = resolved_refs[:8]
+
+    action = decision.get("next_action")
+    if not isinstance(action, dict):
+        action = {}
+        decision["next_action"] = action
+    raw_targets = action.get("target_patches")
+    raw_targets = raw_targets if isinstance(raw_targets, list) else []
+    resolved_targets: list[str] = []
+    invalid_targets: list[Any] = []
+    resolved_target_records: list[dict[str, str]] = []
+    for handle in raw_targets:
+        patch_id = visible_handle_map.get(handle) if isinstance(handle, str) else None
+        if patch_id is None:
+            invalid_targets.append(handle)
+            continue
+        if patch_id not in resolved_targets:
+            resolved_targets.append(patch_id)
+            resolved_target_records.append({"handle": handle, "patch_id": patch_id})
+    action["target_patches"] = resolved_targets
+
+    validation = {
+        "protocol": EvidenceHandleRegistry.protocol,
+        "status": "filtered" if invalid_refs or invalid_targets else "passed",
+        "requested_evidence_handles": raw_refs,
+        "resolved_evidence_refs": resolved_ref_records,
+        "dropped_invalid_evidence_handles": invalid_refs,
+        "requested_target_handles": raw_targets,
+        "resolved_target_patches": resolved_target_records,
+        "dropped_invalid_target_handles": invalid_targets,
+    }
+    decision["evidence_handle_validation"] = validation
+    if invalid_refs:
+        decision["evidence_ref_validation"] = {
+            "status": "filtered",
+            "protocol": EvidenceHandleRegistry.protocol,
+            "dropped_invisible_refs": invalid_refs,
+        }
+    return decision, reported_patch_refs
 
 
 def _normalize_repeated_focus_action(
@@ -420,12 +610,42 @@ def _build_accumulated_executor_evidence(
     evidence_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[str, list[str]]:
     """Build one Executor state whose visible IDs exactly match its described evidence."""
+    state = _build_accumulated_executor_evidence_state(
+        descriptions,
+        accumulated_patch_ids,
+        magnification,
+        char_limit,
+        evidence_metadata=evidence_metadata,
+        handle_registry=None,
+    )
+    return state["text"], state["visible_patch_ids"]
+
+
+def _build_accumulated_executor_evidence_state(
+    descriptions: dict[str, str],
+    accumulated_patch_ids: list[str],
+    magnification: int,
+    char_limit: int,
+    evidence_metadata: dict[str, dict[str, Any]] | None = None,
+    handle_registry: EvidenceHandleRegistry | None = None,
+) -> dict[str, Any]:
+    """Build Executor evidence plus an optional short-handle translation map."""
+
     visible_patch_ids = []
     evidence_items = []
     for patch_id in accumulated_patch_ids:
         if patch_id in descriptions and str(descriptions[patch_id]).strip() and patch_id not in visible_patch_ids:
             visible_patch_ids.append(patch_id)
             evidence_items.append((patch_id, descriptions[patch_id]))
+    visible_handle_map = (
+        handle_registry.register(visible_patch_ids)
+        if handle_registry is not None
+        else {patch_id: patch_id for patch_id in visible_patch_ids}
+    )
+    display_id_by_patch = {
+        patch_id: handle
+        for handle, patch_id in visible_handle_map.items()
+    }
     if evidence_metadata:
         parts = ["[Per-patch WSI evidence metadata]"]
         for patch_id, description in evidence_items:
@@ -441,21 +661,39 @@ def _build_accumulated_executor_evidence(
                 else "unknown"
             )
             parts.append(
-                f"[{patch_id} | Level0=({x},{y}) | Magnification={mag}x | FOV={fov}] {description}"
+                f"[{display_id_by_patch[patch_id]} | Level0=({x},{y}) | Magnification={mag}x | FOV={fov}] {description}"
             )
         evaluation_text = "\n\n".join(parts)
     else:
-        evaluation_text = build_descriptions_with_meta(
-            evidence_items,
-            mag_level=magnification,
-            include_header=True,
-            include_coords=True,
-        )
+        if handle_registry is None:
+            evaluation_text = build_descriptions_with_meta(
+                evidence_items,
+                mag_level=magnification,
+                include_header=True,
+                include_coords=True,
+            )
+        else:
+            parts = [f"[Current Magnification: {magnification}x]"]
+            for patch_id, description in evidence_items:
+                x, y = extract_coords_from_name(patch_id)
+                coordinate = f"({x},{y})" if x is not None and y is not None else "(unknown)"
+                parts.append(
+                    f"[{display_id_by_patch[patch_id]} | Coord={coordinate}] {description}"
+                )
+            evaluation_text = "\n\n".join(parts)
     if len(evaluation_text) > char_limit:
         raise ExecutorContextBudgetExceeded(
             f"Accumulated Executor evidence has {len(evaluation_text)} characters; hard limit is {char_limit}."
         )
-    return evaluation_text, visible_patch_ids
+    return {
+        "text": evaluation_text,
+        "visible_patch_ids": visible_patch_ids,
+        "visible_handles": list(visible_handle_map),
+        "visible_handle_map": visible_handle_map,
+        "handle_protocol": (
+            EvidenceHandleRegistry.protocol if handle_registry is not None else "legacy_patch_id"
+        ),
+    }
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -479,19 +717,32 @@ def _describe_patch(
     magnification,
     operation="question_focused_morphology",
     inspection_focus=None,
+    raw_inspection_focus=None,
     description_cache=None,
     cache_path=None,
     image_provider=None,
     evidence_metadata=None,
 ):
     patch_geometry = (evidence_metadata or {}).get(patch_name, {})
+    effective_focus = inspection_focus or GENERIC_MORPHOLOGY_FOCUS
+    actual_user_prompt = None
     cache_payload = {
-        "cache_schema": "patho_morphology_cache_v2",
+        "cache_schema": "patho_morphology_cache_v3",
         "prompt_version": args.patho_prompt_version,
         "model": args.patho_r1_ckpt,
+        "output_contract": getattr(args, "patho_output_contract", "base"),
+        "adapter_sha256": getattr(args, "patho_lora_adapter_sha256", None),
         "slide_id": slide_id,
         "patch_id": patch_name,
-        "inspection_focus": inspection_focus or GENERIC_MORPHOLOGY_FOCUS,
+        "inspection_focus": (
+            effective_focus if operation == "executor_requested_inspect" else None
+        ),
+        "actual_user_prompt_sha256": (
+            hashlib.sha256(actual_user_prompt.encode("utf-8")).hexdigest()
+            if actual_user_prompt is not None
+            else None
+        ),
+        "actual_user_prompt": actual_user_prompt,
         "magnification": magnification,
         "operation": operation,
         "evidence_geometry": {
@@ -512,6 +763,11 @@ def _describe_patch(
     cache_key = hashlib.sha256(
         json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+    cache_trace_request = {
+        **cache_payload,
+        "inspection_focus_raw": raw_inspection_focus,
+        "inspection_focus_sanitized": effective_focus,
+    }
     if description_cache is not None and cache_key in description_cache:
         if image_provider is not None:
             _, registration = image_provider(patch_name, magnification)
@@ -524,7 +780,7 @@ def _describe_patch(
         call_id = recorder.before_call(
             "patho_r1_cache",
             operation,
-            {**cache_payload, "cache_key": cache_key},
+            {**cache_trace_request, "cache_key": cache_key},
             step_id=step_id,
             attempt=attempt,
         )
@@ -563,7 +819,7 @@ def _describe_patch(
         magnification=magnification,
         choices=choices,
         morphology_only=True,
-        inspection_focus=inspection_focus or GENERIC_MORPHOLOGY_FOCUS,
+        inspection_focus=effective_focus,
         prompt_version=args.patho_prompt_version,
         trace_recorder=recorder,
         trace_context={"step_id": step_id, "attempt": attempt},
@@ -580,11 +836,14 @@ def _describe_patch(
     return description
 
 
-def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class):
+def run_pancreatic_v2(args, retriever_factory, patho_model_class, patho_processor_class):
     _validate_frozen_patho_canvas(args)
     general_v2 = args.executor_protocol == "general_v2"
     protocol_name = "general_v2" if general_v2 else "pancreatic_v2"
+    experiment_policy = getattr(args, "experiment_policy", "full_loop")
     evidence_policy = getattr(args, "evidence_policy", "model_v1")
+    if experiment_policy == "one_shot" and not general_v2:
+        raise ValueError("--experiment_policy one_shot requires --executor_protocol general_v2")
     if evidence_policy == "contract_v1" and not general_v2:
         raise ValueError("--evidence_policy contract_v1 requires --executor_protocol general_v2")
     if getattr(args, "initial_top_k", None) is not None and args.initial_top_k < 1:
@@ -605,7 +864,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         required_wsi_args = {
             "--wsi_manifest": args.wsi_manifest,
             "--patch_manifest_dir": args.patch_manifest_dir,
-            "--feature_h5_dir": args.feature_h5_dir,
+            "--retriever_feature_dir": args.retriever_feature_dir,
         }
         missing = [name for name, value in required_wsi_args.items() if not value]
         if missing:
@@ -685,8 +944,15 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         request_char_limit=args.executor_request_char_limit,
         budget_rmb=args.executor_budget_rmb,
         privacy_forbidden_file=getattr(args, "executor_privacy_forbidden_file", None),
+        shared_state_path=getattr(args, "executor_shared_state", None),
+        retry_schedule_seconds=tuple(getattr(args, "executor_retry_schedule_seconds", (2.0, 3.0, 5.0))),
+        required_returned_model=getattr(args, "executor_required_returned_model", None),
     )
-    plip = plip_class(args.plip_ckpt)
+    retriever = retriever_factory(
+        args.retriever_backend,
+        args.retriever_lib_path,
+        args.retriever_checkpoint,
+    )
     patho_model = None
     patho_processor = None
     if not args.disable_patho_r1_runtime:
@@ -733,16 +999,20 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         "thinking_enabled": False,
         "patho_r1_model": args.patho_r1_ckpt,
         "patho_r1_runtime": not args.disable_patho_r1_runtime,
-        "plip_model": args.plip_ckpt,
+        "patho_output_contract": getattr(args, "patho_output_contract", "base"),
+        "patho_lora_adapter": getattr(args, "patho_lora_adapter", None),
+        "patho_lora_adapter_sha256": getattr(args, "patho_lora_adapter_sha256", None),
+        "retriever": retriever.spec.to_dict(),
         "executor_protocol": protocol_name,
         "agent_policy_version": (
-            "general_v2_wsi_focus_c_v2" if general_v2 and zoom_backend == "wsi"
-            else "pancreatic_v4_wsi_focus_c_v2" if zoom_backend == "wsi"
-            else "general_v2_dual_output_v1" if general_v2
-            else "pancreatic_v3_single_answer_source"
+            "general_v2_wsi_focus_c_v3_evidence_handles" if general_v2 and zoom_backend == "wsi"
+            else "pancreatic_v4_wsi_focus_c_v3_evidence_handles" if zoom_backend == "wsi"
+            else "general_v2_dual_output_v2_evidence_handles" if general_v2
+            else "pancreatic_v3_evidence_handles"
         ),
+        "evidence_reference_protocol": EvidenceHandleRegistry.protocol,
         "patho_prompt_version": args.patho_prompt_version,
-        "patho_cache_schema": "patho_morphology_cache_v2",
+        "patho_cache_schema": "patho_morphology_cache_v3",
         "zoom_backend": zoom_backend,
         "patho_observation_size": args.patho_observation_size,
         "patho_observation_canvas": [
@@ -757,6 +1027,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         "focus_target_morphology_recall_status": "not_yet_validated" if zoom_backend == "wsi" else None,
         "max_focus_actions": 1,
         "confidence_status": "uncalibrated",
+        "experiment_policy": experiment_policy,
         "evidence_policy": evidence_policy,
         "output_schema_version": (
             OUTPUT_SCHEMA_VERSION if evidence_policy == "contract_v1" else None
@@ -782,14 +1053,14 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         ),
     }
     trace_root.mkdir(parents=True, exist_ok=True)
-    cache_path = trace_root / "patho_morphology_cache_v2.json"
+    cache_path = trace_root / "patho_morphology_cache_v3.json"
     if cache_path.exists():
         patho_description_cache = json.loads(cache_path.read_text(encoding="utf-8"))
     else:
         patho_description_cache = {}
     run_manifest = {
         "run_id": run_id,
-        "schema_version": "pathagent_trace_v2",
+        "schema_version": "pathagent_trace_v3",
         "question_count": len(pairs),
         "rollouts_per_question": args.rollouts_per_question,
         "runtime": runtime,
@@ -797,12 +1068,16 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
         "descriptions_file": str(Path(args.descriptions_file).resolve()) if args.descriptions_file else None,
         "wsi_manifest": str(Path(args.wsi_manifest).resolve()) if args.wsi_manifest else None,
         "patch_manifest_dir": str(Path(args.patch_manifest_dir).resolve()) if args.patch_manifest_dir else None,
-        "feature_h5_dir": str(Path(args.feature_h5_dir).resolve()) if args.feature_h5_dir else None,
+        "retriever_feature_dir": (
+            str(Path(args.retriever_feature_dir).resolve())
+            if args.retriever_feature_dir
+            else None
+        ),
         "focus_tissue_mask_dirs": [
             str(Path(value).resolve())
             for value in focus_tissue_mask_dirs
         ],
-        "focus_tissue_mask_resolution": "explicit_dirs_only" if zoom_backend == "wsi" else None,
+        "focus_tissue_mask_resolution": "explicit_dirs_then_pilot_relative_split_defaults" if zoom_backend == "wsi" else None,
         "patho_prompt_version": args.patho_prompt_version,
         "patho_cache_file": str(cache_path.resolve()),
         "evidence_contracts_path": (
@@ -896,14 +1171,19 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                 print(f"Skipping {question_id}: slide is absent from WSI manifest.")
                 continue
             region_path = Path(args.patch_manifest_dir) / f"{slide_id}.jsonl"
-            feature_path = Path(args.feature_h5_dir) / f"{slide_id}.plip.v1.h5"
+            feature_path = Path(args.retriever_feature_dir) / retriever_feature_filename(
+                slide_id, retriever.spec.backend
+            )
             base_regions = load_patch_manifest(region_path, selected_only=True)
-            available, feature_matrix = load_plip_h5(feature_path)
-            if set(available) != set(base_regions):
-                raise RuntimeError(
-                    f"Patch manifest/PLIP HDF5 mismatch for {slide_id}: "
-                    f"manifest={len(base_regions)}, features={len(available)}"
-                )
+            available, feature_matrix, _feature_metadata = load_retriever_h5(
+                feature_path,
+                expected_spec=retriever.spec,
+                expected_patch_ids=list(base_regions),
+                expected_manifest_sha256=_sha256_file(region_path),
+                expected_input_fingerprint_sha256=resolve_wsi_input_fingerprint(
+                    wsi_rows[slide_id]
+                )[0],
+            )
             base_feature_cache = {
                 patch_id: feature_matrix[index]
                 for index, patch_id in enumerate(available)
@@ -917,7 +1197,9 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                 patch_id: base_regions[patch_id].to_dict() for patch_id in available
             }
             if slide_id not in focus_mask_cache:
-                focus_mask_path = _resolve_focus_tissue_mask_path(args, slide_id)
+                focus_mask_path = _resolve_focus_tissue_mask_path(
+                    args, slide_id, str(wsi_rows[slide_id].get("split", "dev"))
+                )
                 focus_mask_cache[slide_id] = (
                     focus_mask_path,
                     load_binary_mask(focus_mask_path),
@@ -950,7 +1232,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                 f"contract_v1 found no audited clean descriptions for slide {slide_id}"
             )
         if not available:
-            print(f"Skipping {question_id}: no PLIP features.")
+            print(f"Skipping {question_id}: no retriever features.")
             continue
         if args.disable_patho_r1_runtime and not any(base_descriptions.values()):
             raise RuntimeError(
@@ -1039,6 +1321,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
             rollout_image_provider = image_provider if zoom_backend == "wsi" else None
             process = []
             final_answer = None
+            evidence_handle_registry = EvidenceHandleRegistry()
             accumulated = []
             remaining = list(available)
             patches_this_round = []
@@ -1051,8 +1334,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
             candidate_stability_count = 0
             try:
                 initial_query = _initial_retrieval_query(question)
-                query_embedding = _plip_text(plip, initial_query, recorder, "initial_morphology_embedding", 1, 0)
-                query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=-1, keepdims=True)
+                query_embedding = _retriever_text(retriever, initial_query, recorder, "initial_morphology_embedding", 1, 0)
                 ranked = _rank(available, feature_matrix, query_embedding)
                 initial_count = initial_retrieval_count(
                     len(available), args.initial_sample_ratio, getattr(args, "initial_top_k", None)
@@ -1065,7 +1347,9 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                     "retrieve",
                     {
                         "query": initial_query,
-                        "ranking_method": "plip_cosine_similarity",
+                        "ranking_method": "cosine_similarity",
+                        "retriever_backend": retriever.spec.backend,
+                        "retriever_model_id": retriever.spec.model_id,
                         "selected": [{"patch_id": name, "score": score} for name, score in initial_ranked],
                         "candidate_count": len(available),
                     },
@@ -1128,18 +1412,27 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                             described_online.add(patch_name)
 
                     try:
-                        evaluation_text, executor_visible_patch_ids = _build_accumulated_executor_evidence(
+                        executor_evidence_state = _build_accumulated_executor_evidence_state(
                             descriptions,
                             accumulated,
                             zoom_level,
                             args.executor_request_char_limit,
                             evidence_metadata=evidence_metadata if zoom_backend == "wsi" else None,
+                            handle_registry=evidence_handle_registry,
                         )
+                        evaluation_text = executor_evidence_state["text"]
+                        executor_visible_patch_ids = executor_evidence_state["visible_patch_ids"]
+                        executor_visible_handles = executor_evidence_state["visible_handles"]
+                        executor_visible_handle_map = executor_evidence_state["visible_handle_map"]
                         action_evaluator = evaluate_general_vqa_action if general_v2 else evaluate_pancreatic_vqa_action
                         evaluator_kwargs = {
-                            "visible_patch_ids": executor_visible_patch_ids,
+                            "visible_patch_ids": executor_visible_handles,
                             "remaining_patch_count": len(remaining),
-                            "can_zoom": patho_model is not None and focus_actions_used < 1,
+                            "can_zoom": (
+                                experiment_policy == "full_loop"
+                                and patho_model is not None
+                                and focus_actions_used < 1
+                            ),
                             "question_type": pair.get("question_type"),
                             "temperature": sampling["temperature"],
                             "top_p": sampling["top_p"],
@@ -1191,7 +1484,10 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                             }
                         termination_reason = "context_budget_exceeded"
                         break
-                    reported_evidence_refs = deepcopy(decision.get("evidence_refs"))
+                    decision, reported_evidence_refs = _resolve_executor_evidence_handles(
+                        decision,
+                        executor_visible_handle_map,
+                    )
                     decision = _filter_visible_evidence_refs(decision, executor_visible_patch_ids)
                     if evidence_policy == "contract_v1":
                         executor_missing_evidence = deepcopy(
@@ -1303,6 +1599,16 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                                     else "model_answer_lacked_contract_support"
                                 ),
                             }
+                    decision, experiment_repair = normalize_experiment_action(
+                        decision, experiment_policy, len(remaining)
+                    )
+                    if experiment_repair is not None:
+                        recorder.record_state(
+                            "experiment_policy_normalized",
+                            experiment_repair,
+                            step_id=step_id,
+                            attempt=attempt,
+                        )
                     decision, focus_repair = _normalize_repeated_focus_action(
                         decision, focus_actions_used, len(remaining)
                     )
@@ -1324,10 +1630,93 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                     process.append(process_item)
                     recorder.record_state(
                         "agent_action",
-                        {"state_visible_patches": list(executor_visible_patch_ids), "decision": decision},
+                        {
+                            "state_visible_patches": list(executor_visible_patch_ids),
+                            "state_visible_evidence_handles": list(executor_visible_handles),
+                            "state_evidence_handle_map": dict(executor_visible_handle_map),
+                            "decision": decision,
+                        },
                         step_id=step_id,
                         attempt=attempt,
                     )
+
+                    if experiment_policy == "one_shot":
+                        if evidence_policy == "contract_v1" and not decision.get(
+                            "evidence_sufficient", False
+                        ):
+                            final_answer = _contract_final_from_candidate(
+                                best_candidate,
+                                choices,
+                                explanation="One-shot retrieval ended without unique cited contract support.",
+                                stop_reason_detail="One-shot evidence did not satisfy contract_v1.",
+                            )
+                        else:
+                            evidence_refs = [
+                                ref
+                                for ref in decision.get("evidence_refs", [])
+                                if ref in set(accumulated)
+                            ][:5]
+                            final_answer = {
+                                "answer": decision.get(
+                                    "benchmark_answer", _benchmark_fallback(choices)
+                                ),
+                                "evidence_refs": evidence_refs,
+                                "explanation": decision.get("evidence_summary")
+                                or decision.get("action_reason"),
+                                "confidence": None,
+                                "confidence_status": "uncalibrated",
+                                "raw_output": decision.get("raw_texts", {}).get(
+                                    "action_raw"
+                                ),
+                                "parse_status": decision.get(
+                                    "parse_status", "invalid_action_json"
+                                ),
+                                "evidence_policy": evidence_policy,
+                                "evidence_sufficient": bool(
+                                    decision.get("evidence_sufficient", False)
+                                ),
+                                "evidence_found": bool(
+                                    decision.get("evidence_found", False)
+                                ),
+                                "citation_valid": bool(
+                                    decision.get("citation_valid", False)
+                                ),
+                                "citation_supports_answer": bool(
+                                    decision.get("citation_supports_answer", False)
+                                ),
+                                "abstain_recommended": bool(
+                                    decision.get("abstain_recommended", False)
+                                ),
+                                "unsupported_answer_reason": decision.get(
+                                    "unsupported_answer_reason", ""
+                                ),
+                                "selected_candidate_attempt": attempt,
+                                "ranked_differential": decision.get(
+                                    "ranked_differential", []
+                                ),
+                                "evidence_contract_verification": decision.get(
+                                    "evidence_contract_verification", {}
+                                ),
+                            }
+                        process_item.update(
+                            {
+                                "mode": "one_shot_answer",
+                                "answer": final_answer["answer"],
+                                "explanation": final_answer["explanation"],
+                            }
+                        )
+                        termination_reason = "one_shot_complete"
+                        recorder.record_state(
+                            "one_shot_terminal",
+                            {
+                                "model_requested_action": action,
+                                "benchmark_answer": final_answer["answer"],
+                                "visible_patch_count": len(executor_visible_patch_ids),
+                            },
+                            step_id=step_id,
+                            attempt=attempt,
+                        )
+                        break
 
                     if attempt == args.max_attempts and action["type"] not in {"answer", "abstain"}:
                         recorder.record_state(
@@ -1433,6 +1822,16 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                         if patho_model is None:
                             action["type"] = "abstain"
                             continue
+                        raw_inspection_focus = (
+                            action.get("query")
+                            or _missing_evidence_text(decision)
+                            or ""
+                        )
+                        sanitized_inspection_focus = _sanitize_inspection_focus(
+                            raw_inspection_focus,
+                            choices,
+                            question=question,
+                        )
                         for patch_name in targets:
                             _describe_patch(
                                 patch_name,
@@ -1448,12 +1847,8 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                                 attempt,
                                 evidence_magnifications.get(patch_name, 5),
                                 operation="executor_requested_inspect",
-                                inspection_focus=_safe_inspection_focus(
-                                    action.get("query")
-                                    or _missing_evidence_text(decision)
-                                    or question,
-                                    choices,
-                                ),
+                                inspection_focus=sanitized_inspection_focus,
+                                raw_inspection_focus=raw_inspection_focus,
                                 description_cache=patho_description_cache,
                                 cache_path=cache_path,
                                 image_provider=rollout_image_provider,
@@ -1472,8 +1867,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                             or _missing_evidence_text(decision)
                             or question
                         )
-                        query_emb = _plip_text(plip, query, recorder, "replenish_query_embedding", step_id, attempt)
-                        query_emb = query_emb / np.linalg.norm(query_emb, axis=-1, keepdims=True)
+                        query_emb = _retriever_text(retriever, query, recorder, "replenish_query_embedding", step_id, attempt)
                         remaining_matrix = np.stack([feature_cache[name] for name in remaining])
                         replenished = _rank(remaining, remaining_matrix, query_emb)
                         add_count = replenishment_count(
@@ -1528,8 +1922,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                             or _missing_evidence_text(decision)
                             or question
                         )
-                        zoom_query_emb = _plip_text(plip, zoom_query, recorder, "zoom_query_embedding", step_id, attempt)
-                        zoom_query_emb = zoom_query_emb / np.linalg.norm(zoom_query_emb, axis=-1, keepdims=True)
+                        zoom_query_emb = _retriever_text(retriever, zoom_query, recorder, "zoom_query_embedding", step_id, attempt)
                         parent_ranked = _rank(targets, target_matrix, zoom_query_emb)[: args.focus_parent_top_k]
                         candidate_images = []
                         candidate_ids = []
@@ -1538,23 +1931,30 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                             with WSIPyramidReader(wsi_rows[slide_id]) as reader:
                                 for parent_name, parent_score in parent_ranked:
                                     for child in partition_region(evidence_regions[parent_name], zoom_level):
-                                        observation = reader.read(child, 224)
+                                        qc_observation = reader.read(child, 224)
+                                        retriever_observation = (
+                                            qc_observation
+                                            if retriever.spec.input_size == 224
+                                            else reader.read(child, retriever.spec.input_size)
+                                        )
                                         grandqc_tissue_fraction = mask_fraction_for_region(
                                             focus_tissue_mask,
                                             int(wsi_rows[slide_id]["width"]),
                                             int(wsi_rows[slide_id]["height"]),
                                             child,
                                         )
-                                        white_fraction = image_white_fraction(observation.image)
+                                        white_fraction = image_white_fraction(qc_observation.image)
                                         candidate_class = classify_focus_candidate(
                                             grandqc_tissue_fraction, white_fraction
                                         )
-                                        candidate_images.append(observation.image)
+                                        candidate_images.append(retriever_observation.image)
                                         candidate_ids.append(child.patch_id)
                                         candidate_meta.append(
                                             {
-                                                **observation.metadata,
-                                                "parent_plip_score": parent_score,
+                                                **qc_observation.metadata,
+                                                "qc_read_metadata": qc_observation.metadata,
+                                                "retriever_read_metadata": retriever_observation.metadata,
+                                                "parent_retriever_score": parent_score,
                                                 "evidence_source": "original_wsi_pyramid",
                                                 "grandqc_mask_path": str(focus_mask_path.resolve()),
                                                 "grandqc_tissue_fraction": grandqc_tissue_fraction,
@@ -1579,17 +1979,16 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                                             "y": y,
                                             "parent_patch_id": parent_name,
                                             "magnification": zoom_level,
-                                            "parent_plip_score": parent_score,
+                                            "parent_retriever_score": parent_score,
                                             "evidence_source": "legacy_jpeg_crop",
                                         }
                                     )
                         if not candidate_images:
                             patches_this_round = []
                             continue
-                        sub_embeddings = _plip_images(
-                            plip, candidate_images, candidate_ids, recorder, "zoom_subpatch_embeddings", step_id, attempt
+                        sub_embeddings = _retriever_images(
+                            retriever, candidate_images, candidate_ids, recorder, "zoom_subpatch_embeddings", step_id, attempt
                         )
-                        sub_embeddings = sub_embeddings / np.linalg.norm(sub_embeddings, axis=-1, keepdims=True)
                         if zoom_backend == "wsi":
                             raw_scores = np.atleast_1d(
                                 (sub_embeddings @ zoom_query_emb.T).squeeze()
@@ -1610,6 +2009,14 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                                 "focus_candidate_ranking",
                                 {
                                     "strategy": "C_hard_blank_gate_ambiguous_soft_penalty_top2",
+                                    "retriever_backend": retriever.spec.backend,
+                                    "retriever_model_id": retriever.spec.model_id,
+                                    "penalty_scale": FOCUS_AMBIGUOUS_PENALTY_SCALE,
+                                    "penalty_calibration_status": (
+                                        "inherited_from_plip_unvalidated_for_conch"
+                                        if retriever.spec.backend == "conch_v1"
+                                        else "plip_baseline"
+                                    ),
                                     "requested_magnification": requested_mag,
                                     "effective_magnification": zoom_level,
                                     "query": zoom_query,
@@ -1708,6 +2115,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                                     morphology_only=True,
                                     inspection_focus=_safe_inspection_focus(zoom_query, choices),
                                     prompt_version=args.patho_prompt_version,
+                                    output_contract=getattr(args, "patho_output_contract", "base"),
                                     trace_recorder=recorder,
                                     trace_context={"step_id": step_id, "attempt": attempt},
                                     patch_id=best_id,
@@ -1767,7 +2175,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                                     {
                                         **meta,
                                         "patch_id": candidate_id,
-                                        "plip_score": candidate_scores[candidate_id],
+                                        "retriever_score": candidate_scores[candidate_id],
                                     }
                                     for candidate_id, meta in zip(candidate_ids, candidate_meta)
                                 ],
@@ -1799,6 +2207,7 @@ def run_pancreatic_v2(args, plip_class, patho_model_class, patho_processor_class
                             morphology_only=True,
                             inspection_focus=_safe_inspection_focus(zoom_query, choices),
                             prompt_version=args.patho_prompt_version,
+                            output_contract=getattr(args, "patho_output_contract", "base"),
                             trace_recorder=recorder,
                             trace_context={"step_id": step_id, "attempt": attempt},
                             patch_id=best_id,

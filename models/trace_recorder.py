@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-SCHEMA_VERSION = "pathagent_trace_v2"
+SCHEMA_VERSION = "pathagent_trace_v3"
 FORBIDDEN_RAW_KEYS = {
     "answer_zh",
     "gold_answer",

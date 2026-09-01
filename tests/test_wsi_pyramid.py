@@ -121,7 +121,7 @@ def test_focus_strategy_c_hard_filters_blank_and_padding_then_returns_top2():
     by_id = {row["patch_id"]: row for row in ranking}
     assert by_id["blank"]["hard_rejection_reasons"] == ["strict_blank"]
     assert by_id["padded"]["hard_rejection_reasons"] == ["padding"]
-    assert by_id["ambiguous"]["adjusted_score"] < by_id["ambiguous"]["plip_score"]
+    assert by_id["ambiguous"]["adjusted_score"] < by_id["ambiguous"]["retriever_score"]
     assert classify_focus_candidate(0.0, 1.0) == "strict_blank"
     assert classify_focus_candidate(0.30, 0.50) == "definite_nonblank"
 
