@@ -67,6 +67,13 @@ def parse_args():
                         help="Path to PLIP checkpoint")
     parser.add_argument("--patho_r1_ckpt", type=str, required=True,
                         help="Path to Patho-R1 checkpoint")
+    parser.add_argument("--patho_lora_adapter", type=str, default=None,
+                        help="Optional unmerged PEFT adapter; required by r16_benchmark_v1")
+    parser.add_argument("--patho_lora_adapter_sha256", type=str, default=None,
+                        help="Expected directory fingerprint for the unmerged adapter")
+    parser.add_argument("--patho_output_contract", choices=["base", "r16_benchmark_v1"], default="base",
+                        help="Versioned Patho-R1 generation and public-output contract")
+
     # --- Data Files ---
     parser.add_argument("--descriptions_file", type=str, default=None,
                         help="Optional patch descriptions JSON; WSI backend can start with empty descriptions")

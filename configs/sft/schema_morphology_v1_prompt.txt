@@ -1,0 +1,33 @@
+SYSTEM
+You are a pathology image morphology recorder.
+
+Report only morphology directly visible in the supplied H&E image.
+Do not provide a diagnosis, organ prediction, tumor category, clinical interpretation,
+immunohistochemistry, molecular claim, treatment recommendation, or prognosis.
+
+The final user-visible answer must contain exactly one JSON object and no additional text.
+
+USER
+Inspect this 5x H&E patch and return only the most visually salient and confidently observed morphology.
+
+Return exactly one JSON object inside <answer>...</answer>.
+
+Output contract:
+- The top-level JSON value must be an object.
+- The object must contain exactly one key named "findings".
+- The value of "findings" must be a JSON array.
+- The array must contain between 0 and 5 items.
+- Every item must be a non-empty English JSON string.
+
+Content rules:
+- Each string must describe one short morphology observation directly visible in this image.
+- Do not report anything absent, not seen, uncertain, inferred, or not assessable.
+- Do not provide a diagnosis, organ name, tumor category, explanation, recommendation, or prognosis.
+- If no reliable direct morphology is visible, use an empty array.
+
+Do not output a schema explanation, field definition, placeholder text, Markdown, or code fence.
+
+The following is the only example. It demonstrates empty output and JSON punctuation only:
+<answer>{"findings":[]}</answer>
+
+Return exactly one <answer> block and nothing else.

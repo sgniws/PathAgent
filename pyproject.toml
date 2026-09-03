@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pathagent-sft-toolkit"
+version = "0.1.0"
+description = "Privacy-gated morphology Schema SFT utilities for PathAgent research"
+readme = "patho_lora_sft/README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10",
+]
+
+[project.optional-dependencies]
+sft-privacy = [
+  "opencv-python-headless>=4.9",
+  "pytesseract>=0.3.10",
+]
+sft-train = [
+  "torch>=2.0",
+  "transformers>=4.51",
+  "peft>=0.14",
+  "qwen-vl-utils>=0.0.8",
+]
+sft-test = [
+  "pytest>=8,<10",
+  "opencv-python-headless>=4.9",
+]
+
+[tool.setuptools.packages.find]
+include = ["patho_lora_sft*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

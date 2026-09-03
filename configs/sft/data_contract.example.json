@@ -1,0 +1,27 @@
+{
+  "schema_version": "pathagent_sft_data_contract_example_v1",
+  "experiment_id": "REPLACE_WITH_LOCAL_EXPERIMENT_ID",
+  "task": "schema_morphology_v1",
+  "source_manifest": {
+    "path": "/path/to/private/core_patch_manifest.jsonl",
+    "sha256": "REPLACE_WITH_64_HEX_SHA256"
+  },
+  "private_wsi_metadata_manifests": [
+    {
+      "path": "/path/to/private/wsi_manifest.jsonl",
+      "sha256": "REPLACE_WITH_64_HEX_SHA256"
+    }
+  ],
+  "canvas": {"width": 784, "height": 784, "mode": "RGB", "magnification": "5x"},
+  "patient_grouping": {"algorithm": "HMAC-SHA256", "salt_location": "private", "seed": 128},
+  "splits": {
+    "train": {"real_patch_max_per_wsi": 16},
+    "validation": {"real_patch_max_per_wsi": 10},
+    "locked": {"real_patch_max_per_wsi": 10}
+  },
+  "test_data_authorized": false,
+  "forbidden_external_fields": [
+    "filename", "slide_id", "case_id", "pathology_no", "patient_id",
+    "coordinates", "local_path", "report", "organ", "diagnosis"
+  ]
+}

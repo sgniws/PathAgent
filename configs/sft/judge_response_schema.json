@@ -1,0 +1,27 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "patho_claim_audit_v1",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claims", "forbidden_inference"],
+      "properties": {
+        "claims": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["finding_index", "status"],
+            "properties": {
+              "finding_index": {"type": "integer", "minimum": 0, "maximum": 4},
+              "status": {"type": "string", "enum": ["supported", "unsupported", "not_assessable"]}
+            }
+          }
+        },
+        "forbidden_inference": {"type": "boolean"}
+      }
+    }
+  }
+}

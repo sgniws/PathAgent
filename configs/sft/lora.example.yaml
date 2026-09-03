@@ -1,0 +1,17 @@
+experiment_id: REPLACE_WITH_LOCAL_EXPERIMENT_ID
+method: bf16_lora
+base_model: /path/to/authorized/base-model
+rank: 16
+alpha: 32
+dropout: 0.05
+learning_rate: 5.0e-5
+epochs: 1
+gradient_accumulation_steps: 16
+micro_batch_size: 1
+gradient_checkpointing: true
+use_cache: false
+max_sequence_length: 2048
+seed: 128
+target_module_regex: '^model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|mlp\.(gate_proj|up_proj|down_proj))$'
+forbidden_trainable_prefixes: [visual., model.embed_tokens, lm_head]
+merge_adapter: false

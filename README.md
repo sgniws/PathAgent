@@ -59,7 +59,10 @@ Evidence Policy（模型判断或确定性合同）
 | `models/retrievers/` | 通用 Retriever 协议、PLIP 兼容适配器与 CONCH v1 适配器 |
 | `models/evidence_contract.py` | 确定性证据合同和候选答案门控 |
 | `models/trace_recorder.py` | 结构化 Trace、事件日志和盲法检查 |
+| `patho_lora_sft/` | 形态学 Schema SFT、隐私门禁、患者隔离切分、盲审和受约束生成工具包 |
 | `data_processing/wsi_pyramid.py` | WSI 金字塔读取、坐标换算、倍率选择和 focus 排序 |
 | `scripts/` | 数据准备、运行、审计和结果处理工具 |
 | `trace_viewer/` | Trace 的静态浏览界面 |
 | `tests/` | 协议、证据、WSI、Trace 和恢复流程测试 |
+
+SFT 工具包只发布方法代码、配置模板和合成测试，不包含患者数据、patch、教师原始响应、训练 JSONL、adapter 或运行记录。安装和安全边界见 [`patho_lora_sft/README.md`](patho_lora_sft/README.md)。
